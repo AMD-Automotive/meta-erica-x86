@@ -1,0 +1,109 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# welcome.yaml — runtime configuration for the Welcome GUI.
+#
+# Values here are merged over the built-in defaults in welcome_gui/config.py, so
+# you only need to specify what you want to change.
+
+app:
+  title: "PCIe Video Tester"
+  subtitle: "Preflight checks"
+
+# Buttons shown on the welcome screen after all checks pass. `action` names a
+# built-in handler ("console" opens the split-screen Ryzen + Versal consoles).
+welcome:
+  actions:
+    - label: "Launch PCIe video demo"
+      action: console
+
+# The streaming demo launched from a button on the console screen. The host
+# tester runs as a managed child process (so the GStreamer windows inherit the
+# GUI's Wayland session and render on the desktop) while each console pane shows
+# a live monitor. No Ethernet is needed between the boards: the Versal endpoint
+# is brought up over its serial console (endpoint_setup_command, channel count
+# appended) before the host tester is launched in its simplest form. The button
+# toggles Start/Stop; Stop quits the monitors and SIGTERMs the host tester
+# (stopping the streams).
+demo:
+  command: "python3 /opt/welcome-gui/tests/pcie_video_tester.py"
+  channels: 4
+  endpoint_setup_command: "ep_vivid_setup.sh"
+  endpoint_settle_ms: 8000
+  button_label: "\u25b6  Start video streams"
+  stop_label: "\u25a0  Stop demo"
+  monitor_command: "htop"
+
+# Ordered pipeline. Remove/reorder keys to change what runs and when.
+# A critical failure stops the pipeline and shows the error screen.
+pipeline:
+  - drivers
+  - pcie
+  - versal_serial
+  - kmod
+
+checks:
+  # One-shot build + install of the kernel module sources under drivers/.
+  # Runs once (guarded by `marker`); skips cleanly until a Makefile is present.
+  # The driver is mdb5-v4l2 (MDB5 PCIe video bridge V4L2 host driver); its
+  # sources are pulled from the meta-layer recipe at bundle-pack time. The
+  # module is built and installed but deliberately NOT loaded: it must only be
+  # loaded on demand (after the endpoint proxy stamps its mailbox), so boot
+  # auto-load is blacklisted by the OS image and we never modprobe it here.
+  drivers:
+    enabled: true
+    source_dir: drivers          # relative to the app working directory
+    marker: /var/lib/welcome-gui/drivers-installed
+    build_targets: ["all"]
+    install_command: "sudo make install"
+
+  # Versal PCIe endpoint must be enumerated.
+  pcie:
+    enabled: true
+    vendor_device: "10ee:9038"
+    # If the endpoint is missing, reboot the Versal over the FTDI cable (POR_B
+    # reset, OSPI boot) and rescan the PCIe root port, then wait for it to come
+    # back. Mirrors rave-menu's reconfigure_versal.sh.
+    reboot_on_missing: true
+    reboot_attempts: 1
+    reset_mode: mode3-high          # mode3-high = OSPI boot (default); mode3-low = JTAG
+    # The Versal PCIe root port is auto-resolved from the board's DMI board_name
+    # (VPR-7P132/RAVE2-CORE -> 0000:00:02.3, VPR-7X188/RAVE2-MAX -> 0000:00:03.2).
+    # Uncomment to force a specific root port instead of auto-detection.
+    # rescan_root_port: "0000:00:02.3"
+    enumerate_timeout_s: 45         # how long to wait for re-enumeration per reboot
+    rescan_interval_s: 3            # re-issue a root-port rescan this often while waiting
+
+  # Serial query of the Versal image. Two pass/fail conditions are checked and
+  # surfaced on the welcome screen as "OSPI Configuration" and "UFS filesystem";
+  # the listed layers' branch+short-sha are also reported.
+  versal_serial:
+    enabled: true
+    device: /dev/ttyUSB1        # quad FTDI cable; Versal Linux console is iface 01
+    baud: 115200
+    timeout_s: 10
+    # The board boots firmware -> U-Boot -> Linux. We actively drive it to a
+    # ready shell: press Enter at U-Boot's autoboot/menu to take the default
+    # (skipping the countdown), type `boot` if it drops to the U-Boot prompt,
+    # and proceed the instant a Linux shell prompt appears. nudge_interval_s is
+    # how often a lone Enter is sent while the console is silent (to elicit a
+    # prompt / recover a stranded board); settle_timeout_s bounds the whole wait.
+    nudge_interval_s: 2.5
+    settle_timeout_s: 120
+    boot_command: boot
+    model_path: /proc/device-tree/model
+    expect_model: "RAVE2 ECP - AMD Versal Gen 2"
+    buildinfo_path: /etc/buildinfo
+    expect_image_basename: erica-appdev-image
+    report_layers:
+      - meta-erica-edf
+      - meta-erica-h-hardware
+
+  # Module presence check (by name, WITHOUT loading). Verifies the built
+  # mdb5_v4l2.ko is installed in the kernel module tree; it is not loaded here
+  # (the driver is loaded on demand by the e2e orchestrator).
+  kmod:
+    enabled: true
+    modules: ["mdb5_v4l2"]

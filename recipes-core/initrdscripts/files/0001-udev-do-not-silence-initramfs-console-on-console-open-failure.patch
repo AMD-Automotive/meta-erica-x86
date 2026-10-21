@@ -1,0 +1,27 @@
+]633;E;{   echo "From 1a2b3c4d5e6f77889900aabbccddeeff00112233 Mon Sep 17 00:00:00 2001"\x3b   echo "From: AMD EDF <amd-edf@local>"\x3b   echo "Date: Tue, 17 Mar 2026 13:00:00 +0000"\x3b   echo "Subject: [PATCH] udev: do not silence initramfs console on console open failure"\x3b   echo "Upstream-Status: Pending"\x3b   echo\x3b   echo "Avoid redirecting initramfs stdio to /dev/null when /dev/console open"\x3b   echo "fails in udev_run. Keep output visible and fall back to /dev/tty0."\x3b   echo\x3b   diff -u --label udev --label udev "$TMP/udev.old" "$TMP/udev.new" || true\x3b   echo "-- "\x3b   echo "2.34.1"\x3b } > sources/meta-5050a-heterogeneous/recipes-core/initrdscripts/files/0001-udev-do-not-silence-initramfs-console-on-console-open-failure.patch;7ee71286-4ed8-4ea7-ba5e-8a921ff38a62]633;CFrom 1a2b3c4d5e6f77889900aabbccddeeff00112233 Mon Sep 17 00:00:00 2001
+From: AMD EDF <amd-edf@local>
+Date: Tue, 17 Mar 2026 13:00:00 +0000
+Subject: [PATCH] udev: do not silence initramfs console on console open failure
+Upstream-Status: Pending
+
+Avoid redirecting initramfs stdio to /dev/null when /dev/console open
+fails in udev_run. Keep output visible and fall back to /dev/tty0.
+
+--- udev
++++ udev
+@@ -42,7 +42,12 @@
+ 	mkdir -p /var/run
+ 
+ 	# Workaround if console=null, systemd-udevd needs valid stdin, stdout and stderr to work
+-	sh -c "exec 4< /dev/console" || { exec 0> /dev/null; exec 1> /dev/null; exec 2> /dev/null; }
++	if ! sh -c "exec 4< /dev/console"; then
++                msg "WARNING: /dev/console open failed in udev_run; falling back to tty0"
++                if [ -c /dev/tty0 ]; then
++                        exec </dev/tty0 >/dev/tty0 2>&1
++                fi
++        fi
+ 
+ 	$_UDEV_DAEMON --daemon
+ 	udevadm trigger --action=add
+-- 
+2.34.1

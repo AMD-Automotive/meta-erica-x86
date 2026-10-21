@@ -1,0 +1,82 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# recipe.yaml — App Clone (.rave2app authoring recipe)
+#
+# TEMPLATE, for the one case the capture tool cannot do for you: committing a
+# clone. host/capture-app.py writes a complete, ready-to-build recipe next to the
+# members it captured — use that for a local backup or restore. Come here only
+# when you want the clone in git, which means hosting the member somewhere and
+# pinning it by URL so anyone can rebuild it byte-for-byte.
+#
+# Built by: python3 bundles/_packer/make_bundle.py bundles/app-clone/recipe.yaml
+# See README.md for the full flow.
+recipe_version: 1
+
+# ---- Identity (copied verbatim into appimage.yaml + catalog) ----
+id: app-clone
+name: App Clone
+version: "0.0.0"             # set to the capture stamp, as the generated recipe does
+vendor: AMD
+description: >-
+  x86-only clone of a RAVE2 application slot, captured from a live device and
+  repacked as an installable bundle.
+
+# ---- App-slot filesystem the device formats before deploying the rootfs ----
+slot:
+  filesystem: ext4
+  label: app-a
+  mkfs_options: "-O ^orphan_file"   # menu GRUB ext driver can't read orphan_file
+
+# ---- Boot behaviour for the installed app ----
+# host/capture-app.py fills this in from what the source board was actually
+# running, and that is the version to trust. What follows is the shape, for when
+# you are writing one by hand: either point at an entries file the app ships
+#
+#   entries_cfg: /boot/grub/grub.cfg
+#   entry: "Ubuntu"
+#
+# or describe the boot directly. Paths are relative to the app slot, and root=
+# is the installer's to set - it knows which partition the app landed on.
+boot:
+  label: App Clone
+  make_default: false               # install, but leave the current default
+  cmdline:
+    kernel: /boot/vmlinuz
+    ramdisk: /boot/initrd.img
+
+# ---- Moving parts. Resolved in order; each ships as a bundle member. ----
+components:
+  # The one and only component: the captured slot tree. The device formats the
+  # app slot and streams this straight into it.
+  #
+  # Copy `from` and `sha256` out of the recipe host/capture-app.py generated.
+  # For a local build you don't intend to commit, swap this for:
+  #     source:
+  #       type: file
+  #       from: device/rootfs.tar
+  #       produces: x86/rootfs.tar
+  #
+  # The capture is byte-for-byte, so it carries whatever /lib/versal images the
+  # source device had installed. Those ride along as ordinary files — with no
+  # versal-* component declared, the device restores them but does not program
+  # the Versal from them.
+  - name: x86-rootfs
+    kind: x86-rootfs-tar
+    source:
+      type: url
+      from: https://artifacts.example.com/app-captures/app-clone-<stamp>.tar
+      produces: x86/rootfs.tar
+      sha256: ""
+
+# ---- Catalog fields (NEVER enter the bundle; render appstore.json) ----
+catalog:
+  short_description: Cloned app slot (x86)
+  description_long: >-
+    A clone of the x86 application slot taken from a live RAVE2 device, so the
+    exact system that was running there can be reinstalled elsewhere. x86 only —
+    no Versal images are programmed.
+  thumbnail: https://rave2.cicdstorage.com/updates/thumbs/app-clone.png
+  experimental: true

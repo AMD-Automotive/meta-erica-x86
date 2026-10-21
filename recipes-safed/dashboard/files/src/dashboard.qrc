@@ -1,0 +1,22 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+SPDX-License-Identifier: MIT
+Contributors: AK
+Maintainer: AK
+-->
+<RCC>
+	<qresource prefix="/dashboard">
+		<file>images/arm.png</file>
+		<file>images/x86.png</file>
+		<file>images/amd_logo.png</file>
+		<file>images/popup/radeon-car-popup.png</file>
+		<file>images/popup/versal-warning-popup.png</file>
+		<file>qml/App.qml</file>
+		<file>qml/Dashboard.qml</file>
+		<file>qml/Meter.qml</file>
+		<file>qml/Popup.qml</file>
+		<file>qml/radeon.qml</file>
+		<file>qml/versal.qml</file>
+		<file>qml/Win.qml</file>
+	</qresource>
+</RCC>

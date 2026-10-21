@@ -1,0 +1,10 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# Do not automount partitions managed explicitly by RAVE2
+/dev/nvme0n1p2
+/dev/nvme0n1p3
+/dev/nvme0n1p4
+/dev/nvme0n1p5

@@ -1,0 +1,317 @@
+From 18fff7ee15846f3595380333bc9d57e41dd7910f Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 27 Apr 2026 09:06:09 +0100
+Subject: [PATCH] ASoC: amd: add ACP70 machine driver entry for NAU8822
+ (NVTN2023)
+
+Add ASoC machine support for boards that pair the Nuvoton NAU88C22YG
+codec with the AMD ACP7.0 / 7.1 / 7.2 audio coprocessor. The
+specimen board (RAVE2 / FP8 / Strix Halo) wires the codec to ACP
+I2S_SP via APU_I2C3 (ACPI HID NVTN2023), with a dedicated 12.288 MHz
+crystal oscillator on the codec MCLK pin and no MCLK from the SoC.
+Because the codec has its own audio-grade clock, it acts as the I2S
+clock provider on this link (CBP_CFP).
+
+The dai_fmt member on the link drives both ACP cpu-DAI and codec-DAI
+set_fmt via the ASoC core (ACP cpu-DAI honours it via the companion
+'honor DAIFMT master/slave' patch); soc_mclk is left false so the
+ACP audio PLL is not forced into a particular state by hw_params.
+
+The hw_params op only programs the codec PLL and sysclk: the
+companion nau8822 'PLL SDM dither' patch ensures the PLL fractional
+modulator stays active for any input ratio, so the machine driver no
+longer needs to poke codec K1/K2/K3 registers to keep the SDM
+dithering.
+
+Disable the codec pins that are not connected on supported boards
+(AUXOUT1/2, LAUX/RAUX, L2/R2 per RAVE2 schematic page 19) so DAPM
+does not power-bias unused outputs.
+
+Hook the new card into both legacy and SOF DSP dai_links_create
+paths so it works regardless of which firmware path is in use, and
+register a 'NVTN2023' -> 'acp70-nau8822' mapping in the ACP70 ACPI
+machines table.
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ sound/soc/amd/acp/Kconfig           |   1 +
+ sound/soc/amd/acp/acp-legacy-mach.c |  11 ++
+ sound/soc/amd/acp/acp-mach-common.c | 164 ++++++++++++++++++++++++++++
+ sound/soc/amd/acp/acp-mach.h        |   1 +
+ sound/soc/amd/acp/amd-acpi-mach.c   |   4 +
+ 5 files changed, 181 insertions(+)
+
+diff --git a/sound/soc/amd/acp/Kconfig b/sound/soc/amd/acp/Kconfig
+index 977e4f2a7a70..2b5f115dc774 100644
+--- a/sound/soc/amd/acp/Kconfig
++++ b/sound/soc/amd/acp/Kconfig
+@@ -117,6 +117,7 @@ config SND_SOC_AMD_MACH_COMMON
+ 	select SND_SOC_RT5682S
+ 	select SND_SOC_NAU8825
+ 	select SND_SOC_NAU8821
++	select SND_SOC_NAU8822
+ 	select SND_SOC_MAX98388
+ 	help
+ 	  This option enables common Machine driver module for ACP.
+diff --git a/sound/soc/amd/acp/acp-legacy-mach.c b/sound/soc/amd/acp/acp-legacy-mach.c
+index a7a551366a40..35604b6a2f78 100644
+--- a/sound/soc/amd/acp/acp-legacy-mach.c
++++ b/sound/soc/amd/acp/acp-legacy-mach.c
+@@ -86,6 +86,13 @@ static struct acp_card_drvdata acp_dmic_data = {
+ 	.dmic_codec_id = DMIC,
+ };
+ 
++static struct acp_card_drvdata nau8822_acp70_data = {
++	.hs_cpu_id = I2S_SP,
++	.hs_codec_id = NAU8822,
++	.soc_mclk = false,
++	.tdm_mode = false,
++};
++
+ static bool acp_asoc_init_ops(struct acp_card_drvdata *priv)
+ {
+ 	bool has_ops = false;
+@@ -225,6 +232,10 @@ static const struct platform_device_id board_ids[] = {
+ 		.name = "acp-pdm-mach",
+ 		.driver_data = (kernel_ulong_t)&acp_dmic_data,
+ 	},
++	{
++		.name = "acp70-nau8822",
++		.driver_data = (kernel_ulong_t)&nau8822_acp70_data,
++	},
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(platform, board_ids);
+diff --git a/sound/soc/amd/acp/acp-mach-common.c b/sound/soc/amd/acp/acp-mach-common.c
+index 09f6c9a2c041..be8d86165ed8 100644
+--- a/sound/soc/amd/acp/acp-mach-common.c
++++ b/sound/soc/amd/acp/acp-mach-common.c
+@@ -26,6 +26,7 @@
+ #include "../../codecs/rt5682s.h"
+ #include "../../codecs/nau8825.h"
+ #include "../../codecs/nau8821.h"
++#include "../../codecs/nau8822.h"
+ #include "acp-mach.h"
+ 
+ #define PCO_PLAT_CLK 48000000
+@@ -35,6 +36,17 @@
+ #define NAU8821_CODEC_DAI	"nau8821-hifi"
+ #define NAU8821_BCLK		1536000
+ #define NAU8821_FREQ_OUT	12288000
++
++/*
++ * NAU88C22YG: board uses a local 12.288 MHz crystal wired to the codec
++ * MCLK pin (the codec is the I2S clock provider).  Run the codec PLL
++ * rather than driving DAC/ADC directly from MCLK so the PLL fractional
++ * sigma-delta modulator decorrelates reference jitter from the audio
++ * band; see the corresponding nau8822 codec patch which guarantees a
++ * non-zero pll_frac for any input ratio.
++ */
++#define NAU8822_CODEC_DAI	"nau8822-hifi"
++#define NAU8822_MCLK		12288000
+ #define MAX98388_CODEC_DAI	"max98388-aif1"
+ 
+ #define TDM_MODE_ENABLE 1
+@@ -1294,6 +1306,120 @@ static const struct snd_soc_ops acp_8821_ops = {
+ 	.hw_params = acp_nau8821_hw_params,
+ };
+ 
++/*
++ * NAU88C22YG (NVTN2023) on ACP I2S_SP.
++ *
++ * Used on AMD ACP70-class boards (e.g. RAVE2 / Strix Halo) where the
++ * codec has its own audio-grade MCLK XO (12.288 MHz) and acts as the
++ * I2S clock provider (CBP_CFP).  The DAI link's dai_fmt drives both
++ * cpu and codec set_fmt via the ASoC core, so this driver only needs
++ * to program the codec PLL + sysclk in hw_params.
++ */
++SND_SOC_DAILINK_DEF(nau8822,
++		    DAILINK_COMP_ARRAY(COMP_CODEC("i2c-NVTN2023:00",
++						  NAU8822_CODEC_DAI)));
++
++static const struct snd_kcontrol_new nau8822_controls[] = {
++	SOC_DAPM_PIN_SWITCH("Headphone"),
++	SOC_DAPM_PIN_SWITCH("Speaker"),
++};
++
++static const struct snd_soc_dapm_widget nau8822_widgets[] = {
++	SND_SOC_DAPM_HP("Headphone", NULL),
++	SND_SOC_DAPM_SPK("Speaker", NULL),
++};
++
++static const struct snd_soc_dapm_route nau8822_audio_route[] = {
++	{ "Headphone", NULL, "LHP" },
++	{ "Headphone", NULL, "RHP" },
++	{ "Speaker", NULL, "LSPK" },
++	{ "Speaker", NULL, "RSPK" },
++};
++
++static int acp_nau8822_init(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_card *card = rtd->card;
++	struct snd_soc_dapm_context *dapm = snd_soc_card_to_dapm(card);
++	struct snd_soc_component *component = snd_soc_rtd_to_codec(rtd, 0)->component;
++	struct snd_soc_dapm_context *codec_dapm = snd_soc_component_to_dapm(component);
++	int ret;
++
++	ret = snd_soc_dapm_new_controls(dapm, nau8822_widgets,
++					ARRAY_SIZE(nau8822_widgets));
++	if (ret)
++		return ret;
++
++	ret = snd_soc_add_card_controls(card, nau8822_controls,
++					ARRAY_SIZE(nau8822_controls));
++	if (ret)
++		return ret;
++
++	ret = snd_soc_dapm_add_routes(dapm, nau8822_audio_route,
++				      ARRAY_SIZE(nau8822_audio_route));
++	if (ret)
++		return ret;
++
++	/*
++	 * Codec pins not connected on supported boards (RAVE2 schematic
++	 * page 19): keep them powered down so DAPM doesn't waste power
++	 * biasing unconnected outputs.
++	 */
++	snd_soc_dapm_disable_pin(codec_dapm, "AUXOUT1");
++	snd_soc_dapm_disable_pin(codec_dapm, "AUXOUT2");
++	snd_soc_dapm_disable_pin(codec_dapm, "LAUX");
++	snd_soc_dapm_disable_pin(codec_dapm, "RAUX");
++	snd_soc_dapm_disable_pin(codec_dapm, "L2");
++	snd_soc_dapm_disable_pin(codec_dapm, "R2");
++
++	return snd_soc_dapm_sync(dapm);
++}
++
++static int acp_nau8822_hw_params(struct snd_pcm_substream *substream,
++				 struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++	unsigned int freq_out = params_rate(params) * 256;
++	int ret;
++
++	/*
++	 * Run MCLK through the codec's internal PLL.  The PLL's
++	 * fractional-N sigma-delta modulator decorrelates XO jitter from
++	 * the DAC/ADC oversampling clock; direct MCLK mode demodulates
++	 * jitter as audible in-band tones on this board.
++	 */
++	ret = snd_soc_dai_set_pll(codec_dai, 0, NAU8822_CLK_MCLK,
++				  NAU8822_MCLK, freq_out);
++	if (ret < 0) {
++		dev_err(rtd->dev, "nau8822 set_pll err: %d\n", ret);
++		return ret;
++	}
++
++	ret = snd_soc_dai_set_sysclk(codec_dai, NAU8822_CLK_PLL, 0,
++				     SND_SOC_CLOCK_IN);
++	if (ret < 0)
++		dev_err(rtd->dev, "nau8822 set_sysclk err: %d\n", ret);
++
++	return ret;
++}
++
++static int acp_nau8822_startup(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++
++	runtime->hw.channels_max = DUAL_CHANNEL;
++	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
++				   &constraints_channels);
++	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
++				   &constraints_rates);
++	return 0;
++}
++
++static const struct snd_soc_ops acp_nau8822_ops = {
++	.startup = acp_nau8822_startup,
++	.hw_params = acp_nau8822_hw_params,
++};
++
+ SND_SOC_DAILINK_DEF(nau8821,
+ 		    DAILINK_COMP_ARRAY(COMP_CODEC("i2c-NVTN2020:00",
+ 						  NAU8821_CODEC_DAI)));
+@@ -1448,6 +1574,25 @@ int acp_sofdsp_dai_links_create(struct snd_soc_card *card)
+ 			links[i].init = acp_8821_init;
+ 			links[i].ops = &acp_8821_ops;
+ 		}
++		if (drv_data->hs_codec_id == NAU8822) {
++			links[i].codecs = nau8822;
++			links[i].num_codecs = ARRAY_SIZE(nau8822);
++			links[i].init = acp_nau8822_init;
++			links[i].ops = &acp_nau8822_ops;
++			links[i].dai_fmt = SND_SOC_DAIFMT_I2S |
++					   SND_SOC_DAIFMT_NB_NF |
++					   SND_SOC_DAIFMT_CBP_CFP;
++			switch (drv_data->acp_rev) {
++			case ACP70_PCI_ID:
++			case ACP71_PCI_ID:
++			case ACP72_PCI_ID:
++				links[i].platforms = platform_acp70_component;
++				links[i].num_platforms = ARRAY_SIZE(platform_acp70_component);
++				break;
++			default:
++				break;
++			}
++		}
+ 		i++;
+ 	}
+ 
+@@ -1647,6 +1792,25 @@ int acp_legacy_dai_links_create(struct snd_soc_card *card)
+ 				return rc;
+ 			}
+ 		}
++		if (drv_data->hs_codec_id == NAU8822) {
++			links[i].codecs = nau8822;
++			links[i].num_codecs = ARRAY_SIZE(nau8822);
++			links[i].init = acp_nau8822_init;
++			links[i].ops = &acp_nau8822_ops;
++			links[i].dai_fmt = SND_SOC_DAIFMT_I2S |
++					   SND_SOC_DAIFMT_NB_NF |
++					   SND_SOC_DAIFMT_CBP_CFP;
++			switch (drv_data->acp_rev) {
++			case ACP70_PCI_ID:
++			case ACP71_PCI_ID:
++			case ACP72_PCI_ID:
++				links[i].platforms = platform_acp70_component;
++				links[i].num_platforms = ARRAY_SIZE(platform_acp70_component);
++				break;
++			default:
++				break;
++			}
++		}
+ 		i++;
+ 	}
+ 
+diff --git a/sound/soc/amd/acp/acp-mach.h b/sound/soc/amd/acp/acp-mach.h
+index f94c30c20f20..4bab9039a156 100644
+--- a/sound/soc/amd/acp/acp-mach.h
++++ b/sound/soc/amd/acp/acp-mach.h
+@@ -51,6 +51,7 @@ enum codec_endpoints {
+ 	NAU8821,
+ 	MAX98388,
+ 	ES83XX,
++	NAU8822,
+ };
+ 
+ struct acp_mach_ops {
+diff --git a/sound/soc/amd/acp/amd-acpi-mach.c b/sound/soc/amd/acp/amd-acpi-mach.c
+index 27da2a862f1c..a207c70acfee 100644
+--- a/sound/soc/amd/acp/amd-acpi-mach.c
++++ b/sound/soc/amd/acp/amd-acpi-mach.c
+@@ -80,6 +80,10 @@ struct snd_soc_acpi_mach snd_soc_acpi_amd_acp63_acp_machines[] = {
+ EXPORT_SYMBOL_NS_GPL(snd_soc_acpi_amd_acp63_acp_machines, "SND_SOC_ACP_COMMON");
+ 
+ struct snd_soc_acpi_mach snd_soc_acpi_amd_acp70_acp_machines[] = {
++	{
++		.id = "NVTN2023",
++		.drv_name = "acp70-nau8822",
++	},
+ 	{
+ 		.id = "AMDI0029",
+ 		.drv_name = "acp70-acp",
+-- 
+2.34.1
+

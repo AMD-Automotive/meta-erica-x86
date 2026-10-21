@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Author: AMD
+
+rave-mq-objs := rave_mq.o rave_mq_cdev.o
+obj-m += rave-mq.o

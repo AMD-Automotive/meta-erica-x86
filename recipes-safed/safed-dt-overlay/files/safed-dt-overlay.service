@@ -1,0 +1,20 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: AK
+# Maintainer: AK
+
+[Unit]
+Description=Apply RAVE Safe Display PL device tree overlay
+# Needs userspace + the PCI bus populated; runs before the compositor so the
+# rave-kms DRM device exists when Weston starts.
+After=systemd-udev-settle.service local-fs.target
+Before=weston.service
+ConditionPathExists=/usr/lib/rave2-safed/x86.dtbo
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/safed-apply-overlay.sh
+
+[Install]
+WantedBy=multi-user.target

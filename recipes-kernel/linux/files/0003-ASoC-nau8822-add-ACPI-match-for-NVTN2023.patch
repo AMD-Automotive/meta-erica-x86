@@ -1,0 +1,50 @@
+From 83a397db782abd663ae7bd1fb24f462b38c8e4d9 Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 27 Apr 2026 09:02:54 +0100
+Subject: [PATCH] ASoC: nau8822: add ACPI match for NVTN2023
+
+The NAU88C22YG codec is used on AMD ACP70-based x86 boards (e.g.
+RAVE2 / FP8 / Strix Halo) where it is enumerated through ACPI as
+NVTN2023. Add an acpi_match_table entry so the i2c-nau8822 driver
+binds when the BIOS exposes that HID.
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ sound/soc/codecs/nau8822.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/sound/soc/codecs/nau8822.c b/sound/soc/codecs/nau8822.c
+index a4b6c93e3dcb..3064460e1e69 100644
+--- a/sound/soc/codecs/nau8822.c
++++ b/sound/soc/codecs/nau8822.c
+@@ -14,6 +14,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
++#include <linux/acpi.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/pm.h>
+@@ -1219,10 +1220,19 @@ static const struct of_device_id nau8822_of_match[] = {
+ MODULE_DEVICE_TABLE(of, nau8822_of_match);
+ #endif
+ 
++#ifdef CONFIG_ACPI
++static const struct acpi_device_id nau8822_acpi_match[] = {
++	{ "NVTN2023", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, nau8822_acpi_match);
++#endif
++
+ static struct i2c_driver nau8822_i2c_driver = {
+ 	.driver = {
+ 		.name = "nau8822",
+ 		.of_match_table = of_match_ptr(nau8822_of_match),
++		.acpi_match_table = ACPI_PTR(nau8822_acpi_match),
+ 	},
+ 	.probe = nau8822_i2c_probe,
+ 	.id_table = nau8822_i2c_id,
+-- 
+2.34.1
+

@@ -1,0 +1,51 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+// SPDX-License-Identifier: MIT
+// Contributors: AK
+// Maintainer: AK
+
+/dts-v1/;
+/plugin/;
+
+&pl_bridge {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	msix_gpio: gpio@5000 {
+		compatible = "xlnx,xps-gpio-1.00.a";
+		reg = <0x5000 0x1000>;
+		#gpio-cells = <2>;
+		gpio-controller;
+		xlnx,all-outputs = <1>;
+		xlnx,gpio-width = <2>;
+		xlnx,dout-default = <0x0>;
+	};
+
+	gic_gpio: gpio@4000 {
+		compatible = "xlnx,xps-gpio-1.00.a";
+		reg = <0x4000 0x1000>;
+		#gpio-cells = <2>;
+		gpio-controller;
+		xlnx,all-outputs = <1>;
+		xlnx,gpio-width = <2>;
+		xlnx,dout-default = <0x0>;
+	};
+
+	rave_mq: mq@2000 {
+		compatible = "amd,rave-message-queue-1.0";
+		reg = <0x2000 0x2000>, <0x0 0x2000>;
+		reg-names = "tx-bram", "rx-bram";
+		tx-gpios = <&gic_gpio 0 0>;
+		rx-gpios = <&msix_gpio 0 0>;
+		amd,msix-irq = <2>;
+		#mbox-cells = <1>;
+		mboxes = <&rave_mq 3>, <&rave_mq 2>, <&rave_mq 1>, <&rave_mq 0>;
+	};
+
+	rave_kms: crtc {
+		compatible = "amd,rave-kms-1.0";
+		dmas = <&mdb5 8>;
+		dma-names = "h2c";
+		amd,fb-mem = <0x0 0x50100000 0x0 0x3000000>;
+		mboxes = <&rave_mq 0>;
+	};
+};

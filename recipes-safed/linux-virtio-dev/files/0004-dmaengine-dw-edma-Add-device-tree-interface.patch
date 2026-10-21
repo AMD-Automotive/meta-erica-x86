@@ -1,0 +1,613 @@
+From 38a200a418b654766ada494b4b6cab146a34f202 Mon Sep 17 00:00:00 2001
+From: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+Date: Wed, 22 Apr 2026 15:04:13 -0700
+Subject: [PATCH 4/4] dmaengine: dw-edma: Add device tree interface
+
+Add device tree nodes for OF proxy dma engine and PCI to PL bridge. These
+interfaces could be used by platform drivers.
+
+Signed-off-by: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+---
+ drivers/dma/dw-edma/Makefile       |   4 +-
+ drivers/dma/dw-edma/dw-edma-pcie.c |  64 +++++-
+ drivers/dma/dw-edma/of-dw-edma.c   | 333 +++++++++++++++++++++++++++++
+ drivers/dma/dw-edma/of-dw-edma.h   | 145 +++++++++++++
+ 4 files changed, 543 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/dma/dw-edma/of-dw-edma.c
+ create mode 100644 drivers/dma/dw-edma/of-dw-edma.h
+
+diff --git a/drivers/dma/dw-edma/Makefile b/drivers/dma/dw-edma/Makefile
+index 83ab58f87760..e153a03b7fea 100644
+--- a/drivers/dma/dw-edma/Makefile
++++ b/drivers/dma/dw-edma/Makefile
+@@ -5,5 +5,7 @@ dw-edma-$(CONFIG_DEBUG_FS)	:= dw-edma-v0-debugfs.o	\
+ 				   dw-hdma-v0-debugfs.o
+ dw-edma-objs			:= dw-edma-core.o	\
+ 				   dw-edma-v0-core.o	\
+-				   dw-hdma-v0-core.o $(dw-edma-y)
++				   dw-hdma-v0-core.o	\
++				   $(dw-edma-y)
++dw-edma-$(CONFIG_OF_DYNAMIC)	+= of-dw-edma.o
+ obj-$(CONFIG_DW_EDMA_PCIE)	+= dw-edma-pcie.o
+diff --git a/drivers/dma/dw-edma/dw-edma-pcie.c b/drivers/dma/dw-edma/dw-edma-pcie.c
+index c6e3c84db320..c03ddd0fc045 100644
+--- a/drivers/dma/dw-edma/dw-edma-pcie.c
++++ b/drivers/dma/dw-edma/dw-edma-pcie.c
+@@ -17,6 +17,7 @@
+ #include <linux/sizes.h>
+ 
+ #include "dw-edma-core.h"
++#include "of-dw-edma.h"
+ 
+ /* Synopsys */
+ #define DW_PCIE_SYNOPSYS_VSEC_DMA_ID		0x6
+@@ -304,6 +305,53 @@ static u64 dw_edma_get_phys_addr(struct pci_dev *pdev,
+ 	return pci_bus_address(pdev, bar);
+ }
+ 
++static void dw_edma_pcie_release_of_node(void *data)
++{
++	of_dw_edma_remove_node(data);
++}
++
++static int
++dw_edma_pcie_inject_of_nodes(struct pci_dev *pdev,
++			     const struct dw_edma_pcie_data *vsec_data)
++{
++	struct device *dev = &pdev->dev;
++	struct of_dw_edma_dma_params params = {};
++	struct of_dw_edma_bridge_params bridge_params = {};
++	struct device_node *np = NULL;
++	struct device_node *bridge_np = NULL;
++	int err;
++
++	bridge_params.base.label	= "pl_bridge";
++	bridge_params.base.name		= "pci-bridge";
++	bridge_params.base.compatible	= "amd,pci-pl-bridge-0.1";
++	bridge_params.base.vendor	= pdev->vendor;
++	bridge_params.base.device	= pdev->device;
++	bridge_params.res		= &pdev->resource[BAR_3];
++
++	err = of_dw_edma_inject_bridge_node(&bridge_params, &bridge_np);
++	if (err)
++		return err;
++
++	err = devm_add_action_or_reset(dev, dw_edma_pcie_release_of_node,
++				       bridge_np);
++	if (err)
++		return err;
++
++	params.base.label	= "mdb5";
++	params.base.name	= "dma-engine";
++	params.base.compatible	= "amd,dw-edma";
++	params.base.vendor	= pdev->vendor;
++	params.base.device	= pdev->device;
++	params.dma_cells	= 1;
++	params.dma_channels	= vsec_data->wr_ch_cnt + vsec_data->rd_ch_cnt;
++
++	err = of_dw_edma_inject_dma_node(&params, &np);
++	if (err)
++		return err;
++
++	return devm_add_action_or_reset(dev, dw_edma_pcie_release_of_node, np);
++}
++
+ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 			      const struct pci_device_id *pid)
+ {
+@@ -523,11 +571,23 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 		return err;
+ 	}
+ 
++	/*
++	 * For AMD MDB endpoints, inject a matching "amd,dw-edma" node into
++	 * the live device tree so downstream consumers can reference this
++	 * controller via the standard OF DMA bindings.
++	 */
++	if (pdev->vendor == PCI_VENDOR_ID_XILINX) {
++		err = dw_edma_pcie_inject_of_nodes(pdev, vsec_data);
++		if (err)
++			pci_warn(pdev, "failed to inject OF node: %d\n", err);
++		else if ((err = of_dw_edma_populate()))
++			pci_warn(pdev, "failed to populate OF platform: %d\n",
++				 err);
++	}
++
+ 	/* Saving data structure reference */
+ 	pci_set_drvdata(pdev, chip);
+ 
+-	pci_err(pdev, "MDB5 driver probed.\n");
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/dma/dw-edma/of-dw-edma.c b/drivers/dma/dw-edma/of-dw-edma.c
+new file mode 100644
+index 000000000000..74575c360116
+--- /dev/null
++++ b/drivers/dma/dw-edma/of-dw-edma.c
+@@ -0,0 +1,333 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Live device tree node injector for the AMD/Synopsys DesignWare eDMA
++ * engine.
++ *
++ * Copyright (C) 2026 AMD. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "of-dw-edma: " fmt
++
++#include <linux/err.h>
++#include <linux/kernel.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/ioport.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include "of-dw-edma.h"
++
++/*
++ * Add a "<label> = <path>" property to the /__symbols__ node so that the
++ * label can be resolved via of_find_node_by_path() / phandle lookups, the
++ * same way dtc-generated symbols do.
++ */
++static int of_dw_edma_add_symbol(struct of_changeset *ocs,
++				 const char *label,
++				 const char *path)
++{
++	struct device_node *symbols;
++	int ret;
++
++	symbols = of_find_node_by_path("/__symbols__");
++	if (!symbols) {
++		pr_warn("/__symbols__ node missing; skipping label '%s'\n",
++			label);
++		return 0;
++	}
++
++	ret = of_changeset_add_prop_string(ocs, symbols, label, path);
++	of_node_put(symbols);
++	if (ret)
++		pr_err("failed to add symbol '%s': %d\n", label, ret);
++
++	return ret;
++}
++
++int of_dw_edma_inject_dma_node(const struct of_dw_edma_dma_params *params,
++			       struct device_node **np_out)
++{
++	struct of_changeset *ocs;
++	struct device_node *np;
++	char *full_name = NULL;
++	char *path = NULL;
++	int ret;
++
++	if (!params || !params->base.name || !params->base.compatible)
++		return -EINVAL;
++
++	if (!of_root) {
++		pr_err("OF root is not available\n");
++		return -ENODEV;
++	}
++
++	ocs = kzalloc(sizeof(*ocs), GFP_KERNEL);
++	if (!ocs)
++		return -ENOMEM;
++	of_changeset_init(ocs);
++
++	full_name = kstrdup(params->base.name, GFP_KERNEL);
++	if (!full_name) {
++		ret = -ENOMEM;
++		goto err_free_ocs;
++	}
++
++	np = of_changeset_create_node(ocs, of_root, full_name);
++	if (!np) {
++		pr_err("failed to create node '%s'\n", full_name);
++		ret = -ENOMEM;
++		goto err_free_name;
++	}
++
++	ret = of_changeset_add_prop_string(ocs, np, "compatible",
++					   params->base.compatible);
++	if (ret)
++		goto err_put_np;
++
++	ret = of_changeset_add_prop_u32(ocs, np, "#dma-cells",
++					params->dma_cells);
++	if (ret)
++		goto err_put_np;
++
++	ret = of_changeset_add_prop_u32(ocs, np, "dma-channels",
++					params->dma_channels);
++	if (ret)
++		goto err_put_np;
++
++	ret = of_changeset_add_prop_u32(ocs, np, "amd,vendor",
++					params->base.vendor);
++	if (ret)
++		goto err_put_np;
++
++	ret = of_changeset_add_prop_u32(ocs, np, "amd,device",
++					params->base.device);
++	if (ret)
++		goto err_put_np;
++
++	if (params->base.label && params->base.label[0]) {
++		path = kasprintf(GFP_KERNEL, "/%s", full_name);
++		if (!path) {
++			ret = -ENOMEM;
++			goto err_put_np;
++		}
++		ret = of_dw_edma_add_symbol(ocs, params->base.label, path);
++		if (ret)
++			goto err_free_path;
++	}
++
++	ret = of_changeset_apply(ocs);
++	if (ret) {
++		pr_err("failed to apply changeset: %d\n", ret);
++		goto err_free_path;
++	}
++
++	/* TODO: get max phandle */
++	np->phandle = 0x7;
++
++	kfree(path);
++	kfree(full_name);
++
++	if (np_out)
++		*np_out = of_node_get(np);
++
++	/*
++	 * The changeset must outlive the live nodes it created so that
++	 * of_changeset_revert() can be invoked later from
++	 * of_dw_edma_remove_node(). Stash it on the node's data pointer.
++	 */
++	np->data = ocs;
++
++	return 0;
++
++err_free_path:
++	kfree(path);
++err_put_np:
++	/* of_changeset_destroy() will release np via attached entry */
++err_free_name:
++	kfree(full_name);
++err_free_ocs:
++	of_changeset_destroy(ocs);
++	kfree(ocs);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(of_dw_edma_inject_dma_node);
++
++int of_dw_edma_inject_bridge_node(const struct of_dw_edma_bridge_params *params,
++				  struct device_node **np_out)
++{
++	struct of_changeset *ocs;
++	struct device_node *np;
++	char *full_name = NULL;
++	char *path = NULL;
++	u32 *ranges = NULL;
++	int parent_addr_cells, child_addr_cells = 1, child_size_cells = 1;
++	size_t ranges_cells;
++	u64 parent_addr, size;
++	int idx;
++	int ret;
++
++	if (!params || !params->base.name || !params->base.compatible ||
++	    !params->res)
++		return -EINVAL;
++
++	if (!of_root) {
++		pr_err("OF root is not available\n");
++		return -ENODEV;
++	}
++
++	parent_addr = (u64)params->res->start;
++	size = (u64)resource_size(params->res);
++
++	ocs = kzalloc(sizeof(*ocs), GFP_KERNEL);
++	if (!ocs)
++		return -ENOMEM;
++	of_changeset_init(ocs);
++
++	full_name = kasprintf(GFP_KERNEL, "%s@%llx", params->base.name,
++			      (unsigned long long)parent_addr);
++	if (!full_name) {
++		ret = -ENOMEM;
++		goto err_free_ocs;
++	}
++
++	np = of_changeset_create_node(ocs, of_root, full_name);
++	if (!np) {
++		pr_err("failed to create node '%s'\n", full_name);
++		ret = -ENOMEM;
++		goto err_free_name;
++	}
++
++	ret = of_changeset_add_prop_string(ocs, np, "compatible",
++					   params->base.compatible);
++	if (ret)
++		goto err_put_np;
++
++	ret = of_changeset_add_prop_u32(ocs, np, "#address-cells",
++					child_addr_cells);
++	if (ret)
++		goto err_put_np;
++
++	ret = of_changeset_add_prop_u32(ocs, np, "#size-cells",
++					child_size_cells);
++	if (ret)
++		goto err_put_np;
++
++	/*
++	 * Build the "ranges" property: child range starts at address 0 and
++	 * maps to the parent address taken from the supplied PCI BAR
++	 * resource. Encode the parent address using the parent's
++	 * #address-cells (defaulting to 1 when of_root has no such property).
++	 */
++	parent_addr_cells = of_n_addr_cells(np);
++	if (parent_addr_cells <= 0)
++		parent_addr_cells = 1;
++
++	ranges_cells = child_addr_cells + parent_addr_cells + child_size_cells;
++	ranges = kcalloc(ranges_cells, sizeof(*ranges), GFP_KERNEL);
++	if (!ranges) {
++		ret = -ENOMEM;
++		goto err_put_np;
++	}
++
++	if (parent_addr_cells == 1 && upper_32_bits(parent_addr)) {
++		pr_err("parent address %llx does not fit in %d cell\n",
++		       parent_addr, parent_addr_cells);
++		ret = -ERANGE;
++		goto err_free_ranges;
++	}
++
++	if (child_size_cells == 1 && upper_32_bits(size)) {
++		pr_err("range size %llx does not fit in %d cell\n",
++		       size, child_size_cells);
++		ret = -ERANGE;
++		goto err_free_ranges;
++	}
++
++	idx = 0;
++	/* child address (= 0) */
++	ranges[idx++] = 0;
++	/* parent address */
++	if (parent_addr_cells == 2)
++		ranges[idx++] = upper_32_bits(parent_addr);
++	ranges[idx++] = lower_32_bits(parent_addr);
++	/* size */
++	ranges[idx++] = lower_32_bits(size);
++
++	ret = of_changeset_add_prop_u32_array(ocs, np, "ranges", ranges,
++					      ranges_cells);
++	if (ret)
++		goto err_free_ranges;
++
++	if (params->base.label && params->base.label[0]) {
++		path = kasprintf(GFP_KERNEL, "/%s", full_name);
++		if (!path) {
++			ret = -ENOMEM;
++			goto err_free_ranges;
++		}
++		ret = of_dw_edma_add_symbol(ocs, params->base.label, path);
++		if (ret)
++			goto err_free_path;
++	}
++
++	ret = of_changeset_apply(ocs);
++	if (ret) {
++		pr_err("failed to apply changeset: %d\n", ret);
++		goto err_free_path;
++	}
++
++	/* TODO: get max phandle */
++	np->phandle = 0x8;
++
++	kfree(path);
++	kfree(ranges);
++	kfree(full_name);
++
++	if (np_out)
++		*np_out = of_node_get(np);
++
++	/* See of_dw_edma_inject_dma_node() for rationale. */
++	np->data = ocs;
++
++	return 0;
++
++err_free_path:
++	kfree(path);
++err_free_ranges:
++	kfree(ranges);
++err_put_np:
++	/* of_changeset_destroy() will release np via attached entry */
++err_free_name:
++	kfree(full_name);
++err_free_ocs:
++	of_changeset_destroy(ocs);
++	kfree(ocs);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(of_dw_edma_inject_bridge_node);
++
++void of_dw_edma_remove_node(struct device_node *np)
++{
++	struct of_changeset *ocs;
++
++	if (!np)
++		return;
++
++	ocs = np->data;
++	np->data = NULL;
++
++	if (ocs) {
++		of_changeset_revert(ocs);
++		of_changeset_destroy(ocs);
++		kfree(ocs);
++	}
++
++	of_node_put(np);
++}
++EXPORT_SYMBOL_GPL(of_dw_edma_remove_node);
++
++int of_dw_edma_populate(void)
++{
++	return of_platform_populate(NULL, NULL, NULL, NULL);
++}
++EXPORT_SYMBOL_GPL(of_dw_edma_populate);
+diff --git a/drivers/dma/dw-edma/of-dw-edma.h b/drivers/dma/dw-edma/of-dw-edma.h
+new file mode 100644
+index 000000000000..3de6a316d973
+--- /dev/null
++++ b/drivers/dma/dw-edma/of-dw-edma.h
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Live device tree node injector for the AMD/Synopsys DesignWare eDMA
++ * engine. Allows attaching a "amd,dw-edma" node to the live OF tree on
++ * platforms (e.g. x86) where firmware does not provide a device tree.
++ *
++ * Copyright (C) 2026 AMD. All rights reserved.
++ */
++
++#ifndef _OF_DW_EDMA_H
++#define _OF_DW_EDMA_H
++
++#include <linux/of.h>
++
++struct resource;
++
++/**
++ * struct of_dw_edma_node - base parameters describing a OF node to inject.
++ * @label:		Symbol label to register in /__symbols__ (e.g. "mdb5").
++ * 			May be NULL to skip label registration.
++ * @name:		Node name without unit address (e.g. "dma-engine").
++ * @compatible:		Value for the "compatible" property (e.g. "amd,dw-edma").
++ * @vendor:		PCI device vendor.
++ * @device:		PCI device ID.
++ */
++struct of_dw_edma_node {
++	const char	*label;
++	const char	*name;
++	const char	*compatible;
++	u32		vendor;
++	u32		device;
++};
++
++/**
++ * struct of_dw_edma_dma_params - parameters describing the DMA node to inject.
++ * @base:		Base parameters describing the node to inject.
++ * @dma_cells:		Value for the "#dma-cells" property.
++ * @dma_channels:	Value for the "dma-channels" property.
++ */
++struct of_dw_edma_dma_params {
++	struct of_dw_edma_node	base;
++	u32			dma_cells;
++	u32			dma_channels;
++};
++
++/**
++ * struct of_dw_edma_bridge_params - parameters describing a PCI bridge
++ *				     node to inject.
++ * @base:		Base parameters describing the node to inject.
++ * @res:		PCI BAR resource. The bridge "ranges" property maps
++ *			the bridge child range starting at address 0 to the
++ *			parent address @res->start with size resource_size(@res).
++ */
++struct of_dw_edma_bridge_params {
++	struct of_dw_edma_node	base;
++	const struct resource	*res;
++};
++
++#if IS_ENABLED(CONFIG_OF_DYNAMIC)
++/**
++ * of_dw_edma_inject_dma_node() - Create and attach a dw-edma node to the live
++ * 				  device tree.
++ * @params: Description of the node to be created.
++ * @np_out: Optional output pointer that receives a reference to the new node.
++ *	    Caller must call of_dw_edma_remove_node() to detach and release.
++ *
++ * The function builds the following node and applies it as a changeset to
++ * the live device tree root:
++ *
++ *	<params->base.label>: <params->base.name> {
++ *		compatible = <params->base.compatible>;
++ *		#dma-cells = <params->dma_cells>;
++ *		dma-channels = <params->dma_channels>;
++ *		amd,vendor = <params->base.vendor>;
++ *		amd,device = <params->base.device>;
++ *	};
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int of_dw_edma_inject_dma_node(const struct of_dw_edma_dma_params *params,
++			       struct device_node **np_out);
++
++/**
++ * of_dw_edma_inject_bridge_node() - Create and attach a PCI bridge node to the
++ * 				     live device tree.
++ * @params: Description of the bridge node to be created.
++ * @np_out: Optional output pointer that receives a reference to the new node.
++ *	    Caller must call of_dw_edma_remove_node() to detach and release.
++ *
++ * The function builds the following node and applies it as a changeset to
++ * the live device tree root:
++ *
++ *	<params->base.label>: <params->base.name>@<params->res->start> {
++ *		compatible = <params->base.compatible>;
++ *		#address-cells = <1>;
++ *		#size-cells = <1>;
++ *		ranges = <0 params->res->start resource_size(params->res)>;
++ *	};
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int of_dw_edma_inject_bridge_node(const struct of_dw_edma_bridge_params *params,
++				  struct device_node **np_out);
++
++/**
++ * of_dw_edma_remove_node() - Detach a previously injected node.
++ * @np: Node returned via @np_out from of_dw_edma_inject_node().
++ *
++ * Detaches the node from the live tree and drops the caller's reference.
++ */
++void of_dw_edma_remove_node(struct device_node *np);
++
++/**
++ * of_dw_edma_populate() - Populate new platform device.
++ *
++ * Populate all added platform devices.
++ * 
++ * Return: 0 on success, negative errno on failure.
++ */
++int of_dw_edma_populate(void);
++
++#else
++static inline int
++of_dw_edma_inject_dma_node(const struct of_dw_edma_dma_params *params,
++			   struct device_node **np_out)
++{
++	return -ENOTSUPP;
++}
++
++static inline int
++of_dw_edma_inject_bridge_node(const struct of_dw_edma_bridge_params *params,
++			      struct device_node **np_out)
++{
++	return -ENOTSUPP;
++}
++
++static inline void of_dw_edma_remove_node(struct device_node *np) { }
++
++static inline int of_dw_edma_populate(void)
++{
++	return -ENOTSUPP;
++}
++#endif
++
++#endif /* _OF_DW_EDMA_H */

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Thu, 11 Jun 2026 00:00:00 +0100
+Subject: [PATCH] ASoC: amd: acp: make tdm_mode per-I2S-port
+
+acp_chip_info.tdm_mode was a single chip-wide flag, but it is set from
+acp_i2s_set_fmt() per cpu DAI: SND_SOC_DAIFMT_I2S clears it and
+SND_SOC_DAIFMT_DSP_A sets it.  On a board that runs an I2S codec on one
+ACP I2S port and a DSP_A/TDM codec on another (e.g. NAU8822 on I2S_SP
+plus ADAU1860 on I2S_BT), whichever link's set_fmt runs last wins for
+the whole chip.
+
+When the TDM link wins, the I2S port's hw_params path then sets the TDM
+enable bit (BIT(1)) in ITER/IRER and writes a zero TDM frame format
+(the I2S codec never calls set_tdm_slot), so the I2S port's transmit
+and receive deserialisers run in TDM mode with an invalid frame.  This
+corrupts both capture and playback on the I2S port (observed as
+frequency-doubled, fundamental-cancelled capture on NAU8822, with
+ITER/IRER reading 0x53: BIT(1) set, frame-format register 0).
+
+Track tdm_mode per I2S port (array indexed by I2S_SP / I2S_BT / I2S_HS
+instance), mirroring codec_is_clk_provider[], so an I2S codec and a TDM
+codec on different ports keep independent framing.
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+diff --git a/sound/soc/amd/acp/acp-i2s.c b/sound/soc/amd/acp/acp-i2s.c
+index 8df94ddf452b..3c90d2a89b27 100644
+--- a/sound/soc/amd/acp/acp-i2s.c
++++ b/sound/soc/amd/acp/acp-i2s.c
+@@ -52,7 +52,7 @@ static inline void acp_set_i2s_clk(struct acp_chip_info *chip, int dai_id)
+ 
+ 	/* If the codec is the clock provider, ACP operates as I2S slave. */
+ 	val  = chip->codec_is_clk_provider[dai_id - 1] ? 0 : I2S_MASTER_MODE_ENABLE;
+-	if (chip->tdm_mode)
++	if (chip->tdm_mode[dai_id - 1])
+ 		val |= BIT(1);
+ 
+ 	switch (chip->acp_rev) {
+@@ -80,10 +80,10 @@ static int acp_i2s_set_fmt(struct snd_soc_dai *cpu_dai,
+ 	mode = fmt & SND_SOC_DAIFMT_FORMAT_MASK;
+ 	switch (mode) {
+ 	case SND_SOC_DAIFMT_I2S:
+-		chip->tdm_mode = TDM_DISABLE;
++		chip->tdm_mode[cpu_dai->driver->id - 1] = TDM_DISABLE;
+ 		break;
+ 	case SND_SOC_DAIFMT_DSP_A:
+-		chip->tdm_mode = TDM_ENABLE;
++		chip->tdm_mode[cpu_dai->driver->id - 1] = TDM_ENABLE;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -289,7 +289,7 @@ static int acp_i2s_hwparams(struct snd_pcm_substream *substream, struct snd_pcm_
+ 	val = val | (xfer_resolution  << 3);
+ 	writel(val, chip->base + reg_val);
+ 
+-	if (chip->tdm_mode) {
++	if (chip->tdm_mode[dai->driver->id - 1]) {
+ 		val = readl(chip->base + reg_val);
+ 		writel(val | BIT(1), chip->base + reg_val);
+ 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+diff --git a/sound/soc/amd/acp/acp-legacy-common.c b/sound/soc/amd/acp/acp-legacy-common.c
+index 4e477c48d4bd..4938cef7e4fe 100644
+--- a/sound/soc/amd/acp/acp-legacy-common.c
++++ b/sound/soc/amd/acp/acp-legacy-common.c
+@@ -360,7 +360,7 @@ int restore_acp_i2s_params(struct snd_pcm_substream *substream,
+ 		val = chip->xfer_rx_resolution[stream->dai_id - 1] << 3;
+ 	}
+ 	writel(val, chip->base + reg_val);
+-	if (chip->tdm_mode == TDM_ENABLE) {
++	if (chip->tdm_mode[stream->dai_id - 1] == TDM_ENABLE) {
+ 		writel(tdm_fmt, chip->base + fmt_reg);
+ 		val = readl(chip->base + reg_val);
+ 		writel(val | 0x2, chip->base + reg_val);
+diff --git a/sound/soc/amd/acp/amd.h b/sound/soc/amd/acp/amd.h
+index 533d49d7e207..91c9e66a36b3 100644
+--- a/sound/soc/amd/acp/amd.h
++++ b/sound/soc/amd/acp/amd.h
+@@ -169,7 +169,12 @@ struct acp_chip_info {
+ 	bool is_pdm_dev;	/* flag set to true when ACP PDM controller exists */
+ 	bool is_pdm_config;	/* flag set to true when PDM configuration is selected from BIOS */
+ 	bool is_i2s_config;	/* flag set to true when I2S configuration is selected from BIOS */
+-	bool tdm_mode;
++	/*
++	 * True when a given I2S port runs a DSP_A/TDM frame (vs plain I2S).
++	 * Indexed by (I2S_{SP,BT,HS}_INSTANCE - 1) so an I2S codec and a TDM
++	 * codec on different ports do not clobber each other's framing.
++	 */
++	bool tdm_mode[3];
+ 	/*
+ 	 * True when the codec drives BCLK/LRCLK on a given I2S port.
+ 	 * Indexed by (I2S_{SP,BT,HS}_INSTANCE - 1) so the three ports
+-- 
+2.43.0
+

@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# AMD x86 welcome build environment setup script
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# Contributors: KC
+# Maintainer: KC
+# SPDX-License-Identifier: MIT
+
+if [ -n "$BASH_SOURCE" ]; then
+        ROOT=$(readlink -f $(dirname "$BASH_SOURCE"))
+elif [ -n "$ZSH_NAME" ]; then
+        ROOT=$(readlink -f $(dirname "$0"))
+else
+        ROOT=$(readlink -f ${PWD})
+fi
+
+if [ -z ${TEMPLATECONF} ]; then
+    TEMPLATECONF=$ROOT/sources/meta-erica-x86/conf/templates/default
+fi
+
+if [ -d $ROOT/sources/meta-xilinx/meta-xilinx-core/gen-machine-conf ]; then
+    PATH=$ROOT/sources/meta-xilinx/meta-xilinx-core/gen-machine-conf:$PATH
+fi
+
+source $ROOT/sources/poky/oe-init-build-env "$@"

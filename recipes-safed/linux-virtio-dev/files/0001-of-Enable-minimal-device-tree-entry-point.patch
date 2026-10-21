@@ -1,0 +1,78 @@
+From 8a1958c2a8f79e45c454a8ec34d38235d423adb6 Mon Sep 17 00:00:00 2001
+From: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+Date: Mon, 3 Feb 2025 14:13:29 -0800
+Subject: [PATCH 1/4] of: Ensure a __symbols__ node for OF overlays
+
+OF overlays need a live device-tree root with a __symbols__ node so that
+label references in the overlay's __fixups__ can be resolved. On some
+platforms (x86 in particular) recent kernels already provide a minimal
+live root, but without a __symbols__ node, which breaks overlay label
+resolution ("OF: resolver: no symbols in root of device tree").
+
+Create the root if it is entirely absent, and make sure a __symbols__
+node exists in either case when OF_OVERLAY is enabled.
+
+Signed-off-by: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+---
+ drivers/of/base.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/drivers/of/base.c b/drivers/of/base.c
+index ccadc22f1..1857f446b 100644
+--- a/drivers/of/base.c
++++ b/drivers/of/base.c
+@@ -184,11 +184,51 @@ void __init of_core_init(void)
+ void __init of_core_init(void)
+ {
+ 	struct device_node *np;
++#if IS_ENABLED(CONFIG_OF_OVERLAY)
++	struct device_node *symbols;
++#endif
+ 
+ 	of_platform_register_reconfig_notifier();
+ 
+ 	/* Create the kset, and register existing nodes */
+ 	mutex_lock(&of_mutex);
++#if IS_ENABLED(CONFIG_OF_OVERLAY)
++	/*
++	 * OF overlays need a live tree root with a __symbols__ node to resolve
++	 * labels via __fixups__. On some platforms (x86 in particular) recent
++	 * kernels provide a minimal live root but no __symbols__ node. Create
++	 * the root if it is entirely absent, and make sure a __symbols__ node
++	 * exists in either case.
++	 */
++	if (!of_root) {
++		of_root = kzalloc(sizeof(*of_root), GFP_KERNEL);
++		if (!of_root) {
++			mutex_unlock(&of_mutex);
++			pr_err("failed to create root node\n");
++			return;
++		}
++		of_root->full_name = "/";
++		of_node_init(of_root);
++	}
++
++	symbols = of_get_child_by_name(of_root, "__symbols__");
++	if (symbols) {
++		of_node_put(symbols);
++	} else {
++		symbols = kzalloc(sizeof(*symbols), GFP_KERNEL);
++		if (!symbols) {
++			mutex_unlock(&of_mutex);
++			pr_err("failed to create __symbols__ node\n");
++			return;
++		}
++		symbols->full_name = "/__symbols__";
++		symbols->name = "__symbols__";
++		symbols->parent = of_root;
++		of_node_init(symbols);
++		symbols->sibling = of_root->child;
++		of_root->child = symbols;
++	}
++#endif /* CONFIG_OF_OVERLAY */
+ 	of_kset = kset_create_and_add("devicetree", NULL, firmware_kobj);
+ 	if (!of_kset) {
+ 		mutex_unlock(&of_mutex);
+-- 
+2.43.0
+

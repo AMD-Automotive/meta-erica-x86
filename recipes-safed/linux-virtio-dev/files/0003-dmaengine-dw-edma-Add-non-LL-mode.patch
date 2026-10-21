@@ -1,0 +1,352 @@
+From 1e8822705ddedeaa4b4161a07a684e934e8f04fb Mon Sep 17 00:00:00 2001
+From: Anatoliy Klymenko <anatoliy.klymenko@amd.com>
+Date: Mon, 20 Apr 2026 17:19:26 -0700
+Subject: [PATCH 3/4] dmaengine: dw-edma: Add non-LL mode
+
+AMD MDB IP supports Linked List (LL) mode as well as non-LL mode.
+The current code does not have the mechanisms to enable the
+DMA transactions using the non-LL mode. The following two cases
+are added with this patch:
+- For the AMD (Xilinx) only, when a valid physical base address of
+  the device side DDR is not configured, then the IP can still be
+  used in non-LL mode. For all the channels DMA transactions will
+  be using the non-LL mode only. This, the default non-LL mode,
+  is not applicable for Synopsys IP with the current code addition.
+
+- If the default mode is LL-mode, for both AMD (Xilinx) and Synosys,
+  and if user wants to use non-LL mode then user can do so via
+  configuring the peripheral_config param of dma_slave_config.
+
+Signed-off-by: Devendra K Verma <devendra.verma@amd.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://patch.msgid.link/20260318070403.1634706-3-devendra.verma@amd.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+---
+ drivers/dma/dw-edma/dw-edma-core.c    | 47 +++++++++++++++++++-
+ drivers/dma/dw-edma/dw-edma-core.h    |  1 +
+ drivers/dma/dw-edma/dw-edma-pcie.c    | 44 ++++++++++++------
+ drivers/dma/dw-edma/dw-hdma-v0-core.c | 64 ++++++++++++++++++++++++++-
+ drivers/dma/dw-edma/dw-hdma-v0-regs.h |  1 +
+ include/linux/dma/edma.h              |  1 +
+ 6 files changed, 143 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/dma/dw-edma/dw-edma-core.c b/drivers/dma/dw-edma/dw-edma-core.c
+index 5397dbda4f72..b0945d59dff1 100644
+--- a/drivers/dma/dw-edma/dw-edma-core.c
++++ b/drivers/dma/dw-edma/dw-edma-core.c
+@@ -223,6 +223,43 @@ static int dw_edma_device_config(struct dma_chan *dchan,
+ 				 struct dma_slave_config *config)
+ {
+ 	struct dw_edma_chan *chan = dchan2dw_edma_chan(dchan);
++	bool cfg_non_ll;
++	int non_ll = 0;
++
++	chan->non_ll = false;
++	if (chan->dw->chip->mf == EDMA_MF_HDMA_NATIVE) {
++		if (config->peripheral_config &&
++		    config->peripheral_size != sizeof(int)) {
++			dev_err(dchan->device->dev,
++				"config param peripheral size mismatch\n");
++			return -EINVAL;
++		}
++
++		/*
++		 * When there is no valid LLP base address available then the
++		 * default DMA ops will use the non-LL mode.
++		 *
++		 * Cases where LL mode is enabled and client wants to use the
++		 * non-LL mode then also client can do so via providing the
++		 * peripheral_config param.
++		 */
++		cfg_non_ll = chan->dw->chip->cfg_non_ll;
++		if (config->peripheral_config) {
++			non_ll = *(int *)config->peripheral_config;
++
++			if (cfg_non_ll && !non_ll) {
++				dev_err(dchan->device->dev, "invalid configuration\n");
++				return -EINVAL;
++			}
++		}
++
++		if (cfg_non_ll || non_ll)
++			chan->non_ll = true;
++	} else if (config->peripheral_config) {
++		dev_err(dchan->device->dev,
++			"peripheral config param applicable only for HDMA\n");
++		return -EINVAL;
++	}
+ 
+ 	memcpy(&chan->config, config, sizeof(*config));
+ 	chan->configured = true;
+@@ -358,6 +395,7 @@ dw_edma_device_transfer(struct dw_edma_transfer *xfer)
+ 	struct dw_edma_desc *desc;
+ 	u64 src_addr, dst_addr;
+ 	size_t fsz = 0;
++	u32 bursts_max;
+ 	u32 cnt = 0;
+ 	int i;
+ 
+@@ -415,6 +453,13 @@ dw_edma_device_transfer(struct dw_edma_transfer *xfer)
+ 		return NULL;
+ 	}
+ 
++	/*
++	 * For non-LL mode, only a single burst can be handled
++	 * in a single chunk unlike LL mode where multiple bursts
++	 * can be configured in a single chunk.
++	 */
++	bursts_max = chan->non_ll ? 1 : chan->ll_max;
++
+ 	desc = dw_edma_alloc_desc(chan);
+ 	if (unlikely(!desc))
+ 		goto err_alloc;
+@@ -450,7 +495,7 @@ dw_edma_device_transfer(struct dw_edma_transfer *xfer)
+ 		if (xfer->type == EDMA_XFER_SCATTER_GATHER && !sg)
+ 			break;
+ 
+-		if (chunk->bursts_alloc == chan->ll_max) {
++		if (chunk->bursts_alloc == bursts_max) {
+ 			chunk = dw_edma_alloc_chunk(desc);
+ 			if (unlikely(!chunk))
+ 				goto err_alloc;
+diff --git a/drivers/dma/dw-edma/dw-edma-core.h b/drivers/dma/dw-edma/dw-edma-core.h
+index 71894b9e0b15..c8e3d196a549 100644
+--- a/drivers/dma/dw-edma/dw-edma-core.h
++++ b/drivers/dma/dw-edma/dw-edma-core.h
+@@ -86,6 +86,7 @@ struct dw_edma_chan {
+ 	u8				configured;
+ 
+ 	struct dma_slave_config		config;
++	bool				non_ll;
+ };
+ 
+ struct dw_edma_irq {
+diff --git a/drivers/dma/dw-edma/dw-edma-pcie.c b/drivers/dma/dw-edma/dw-edma-pcie.c
+index d979bb8b5c1e..c6e3c84db320 100644
+--- a/drivers/dma/dw-edma/dw-edma-pcie.c
++++ b/drivers/dma/dw-edma/dw-edma-pcie.c
+@@ -295,6 +295,15 @@ static void dw_edma_pcie_get_xilinx_dma_data(struct pci_dev *pdev,
+ 	pdata->devmem_phys_off = off;
+ }
+ 
++static u64 dw_edma_get_phys_addr(struct pci_dev *pdev,
++				 struct dw_edma_pcie_data *pdata,
++				 enum pci_barno bar)
++{
++	if (pdev->vendor == PCI_VENDOR_ID_XILINX)
++		return pdata->devmem_phys_off;
++	return pci_bus_address(pdev, bar);
++}
++
+ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 			      const struct pci_device_id *pid)
+ {
+@@ -303,6 +312,7 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 	struct dw_edma_chip *chip;
+ 	int err, nr_irqs;
+ 	int i, mask;
++	bool non_ll = false;
+ 
+ 	struct dw_edma_pcie_data *vsec_data __free(kfree) =
+ 		kmalloc_obj(*vsec_data);
+@@ -329,21 +339,24 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 
+ 		/*
+ 		 * There is no valid address found for the LL memory
+-		 * space on the device side.
++		 * space on the device side. In the absence of LL base
++		 * address use the non-LL mode or simple mode supported by
++		 * the HDMA IP.
+ 		 */
+ 		if (vsec_data->devmem_phys_off == DW_PCIE_XILINX_MDB_INVALID_ADDR)
+-			return -ENOMEM;
++			non_ll = true;
+ 
+ 		/*
+ 		 * Configure the channel LL and data blocks if number of
+ 		 * channels enabled in VSEC capability are more than the
+ 		 * channels configured in xilinx_mdb_data.
+ 		 */
+-		dw_edma_set_chan_region_offset(vsec_data, BAR_2, 0,
+-					       DW_PCIE_XILINX_MDB_LL_OFF_GAP,
+-					       DW_PCIE_XILINX_MDB_LL_SIZE,
+-					       DW_PCIE_XILINX_MDB_DT_OFF_GAP,
+-					       DW_PCIE_XILINX_MDB_DT_SIZE);
++		if (!non_ll)
++			dw_edma_set_chan_region_offset(vsec_data, BAR_2, 0,
++						       DW_PCIE_XILINX_MDB_LL_OFF_GAP,
++						       DW_PCIE_XILINX_MDB_LL_SIZE,
++						       DW_PCIE_XILINX_MDB_DT_OFF_GAP,
++						       DW_PCIE_XILINX_MDB_DT_SIZE);
+ 	}
+ 
+ 	/* Mapping PCI BAR regions */
+@@ -391,6 +404,7 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 	chip->mf = vsec_data->mf;
+ 	chip->nr_irqs = nr_irqs;
+ 	chip->ops = &dw_edma_pcie_plat_ops;
++	chip->cfg_non_ll = non_ll;
+ 
+ 	chip->ll_wr_cnt = vsec_data->wr_ch_cnt;
+ 	chip->ll_rd_cnt = vsec_data->rd_ch_cnt;
+@@ -399,7 +413,7 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 	if (!chip->reg_base)
+ 		return -ENOMEM;
+ 
+-	for (i = 0; i < chip->ll_wr_cnt; i++) {
++	for (i = 0; i < chip->ll_wr_cnt && !non_ll; i++) {
+ 		struct dw_edma_region *ll_region = &chip->ll_region_wr[i];
+ 		struct dw_edma_region *dt_region = &chip->dt_region_wr[i];
+ 		struct dw_edma_block *ll_block = &vsec_data->ll_wr[i];
+@@ -410,7 +424,8 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 			return -ENOMEM;
+ 
+ 		ll_region->vaddr.io += ll_block->off;
+-		ll_region->paddr = pci_bus_address(pdev, ll_block->bar);
++		ll_region->paddr = dw_edma_get_phys_addr(pdev, vsec_data,
++							 ll_block->bar);
+ 		ll_region->paddr += ll_block->off;
+ 		ll_region->sz = ll_block->sz;
+ 
+@@ -419,12 +434,13 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 			return -ENOMEM;
+ 
+ 		dt_region->vaddr.io += dt_block->off;
+-		dt_region->paddr = pci_bus_address(pdev, dt_block->bar);
++		dt_region->paddr = dw_edma_get_phys_addr(pdev, vsec_data,
++							 dt_block->bar);
+ 		dt_region->paddr += dt_block->off;
+ 		dt_region->sz = dt_block->sz;
+ 	}
+ 
+-	for (i = 0; i < chip->ll_rd_cnt; i++) {
++	for (i = 0; i < chip->ll_rd_cnt && !non_ll; i++) {
+ 		struct dw_edma_region *ll_region = &chip->ll_region_rd[i];
+ 		struct dw_edma_region *dt_region = &chip->dt_region_rd[i];
+ 		struct dw_edma_block *ll_block = &vsec_data->ll_rd[i];
+@@ -435,7 +451,8 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 			return -ENOMEM;
+ 
+ 		ll_region->vaddr.io += ll_block->off;
+-		ll_region->paddr = pci_bus_address(pdev, ll_block->bar);
++		ll_region->paddr = dw_edma_get_phys_addr(pdev, vsec_data,
++							 ll_block->bar);
+ 		ll_region->paddr += ll_block->off;
+ 		ll_region->sz = ll_block->sz;
+ 
+@@ -444,7 +461,8 @@ static int dw_edma_pcie_probe(struct pci_dev *pdev,
+ 			return -ENOMEM;
+ 
+ 		dt_region->vaddr.io += dt_block->off;
+-		dt_region->paddr = pci_bus_address(pdev, dt_block->bar);
++		dt_region->paddr = dw_edma_get_phys_addr(pdev, vsec_data,
++							 dt_block->bar);
+ 		dt_region->paddr += dt_block->off;
+ 		dt_region->sz = dt_block->sz;
+ 	}
+diff --git a/drivers/dma/dw-edma/dw-hdma-v0-core.c b/drivers/dma/dw-edma/dw-hdma-v0-core.c
+index ce8f7254bab2..6cc39b4a0342 100644
+--- a/drivers/dma/dw-edma/dw-hdma-v0-core.c
++++ b/drivers/dma/dw-edma/dw-hdma-v0-core.c
+@@ -225,7 +225,7 @@ static void dw_hdma_v0_sync_ll_data(struct dw_edma_chunk *chunk)
+ 		readl(chunk->ll_region.vaddr.io);
+ }
+ 
+-static void dw_hdma_v0_core_start(struct dw_edma_chunk *chunk, bool first)
++static void dw_hdma_v0_core_ll_start(struct dw_edma_chunk *chunk, bool first)
+ {
+ 	struct dw_edma_chan *chan = chunk->chan;
+ 	struct dw_edma *dw = chan->dw;
+@@ -263,6 +263,68 @@ static void dw_hdma_v0_core_start(struct dw_edma_chunk *chunk, bool first)
+ 	SET_CH_32(dw, chan->dir, chan->id, doorbell, HDMA_V0_DOORBELL_START);
+ }
+ 
++static void dw_hdma_v0_core_non_ll_start(struct dw_edma_chunk *chunk)
++{
++	struct dw_edma_chan *chan = chunk->chan;
++	struct dw_edma *dw = chan->dw;
++	struct dw_edma_burst *child;
++	u32 val;
++
++	child = list_first_entry_or_null(&chunk->burst->list,
++					 struct dw_edma_burst, list);
++	if (!child)
++		return;
++
++	SET_CH_32(dw, chan->dir, chan->id, ch_en, HDMA_V0_CH_EN);
++
++	/* Source address */
++	SET_CH_32(dw, chan->dir, chan->id, sar.lsb,
++		  lower_32_bits(child->sar));
++	SET_CH_32(dw, chan->dir, chan->id, sar.msb,
++		  upper_32_bits(child->sar));
++
++	/* Destination address */
++	SET_CH_32(dw, chan->dir, chan->id, dar.lsb,
++		  lower_32_bits(child->dar));
++	SET_CH_32(dw, chan->dir, chan->id, dar.msb,
++		  upper_32_bits(child->dar));
++
++	/* Transfer size */
++	SET_CH_32(dw, chan->dir, chan->id, transfer_size, child->sz);
++
++	/* Interrupt setup */
++	val = GET_CH_32(dw, chan->dir, chan->id, int_setup) |
++			HDMA_V0_STOP_INT_MASK |
++			HDMA_V0_ABORT_INT_MASK |
++			HDMA_V0_LOCAL_STOP_INT_EN |
++			HDMA_V0_LOCAL_ABORT_INT_EN;
++
++	if (!(dw->chip->flags & DW_EDMA_CHIP_LOCAL)) {
++		val |= HDMA_V0_REMOTE_STOP_INT_EN |
++		       HDMA_V0_REMOTE_ABORT_INT_EN;
++	}
++
++	SET_CH_32(dw, chan->dir, chan->id, int_setup, val);
++
++	/* Channel control setup */
++	val = GET_CH_32(dw, chan->dir, chan->id, control1);
++	val &= ~HDMA_V0_LINKLIST_EN;
++	SET_CH_32(dw, chan->dir, chan->id, control1, val);
++
++	SET_CH_32(dw, chan->dir, chan->id, doorbell,
++		  HDMA_V0_DOORBELL_START);
++}
++
++static void dw_hdma_v0_core_start(struct dw_edma_chunk *chunk, bool first)
++{
++	struct dw_edma_chan *chan = chunk->chan;
++
++	if (chan->non_ll)
++		dw_hdma_v0_core_non_ll_start(chunk);
++	else
++		dw_hdma_v0_core_ll_start(chunk, first);
++}
++
+ static void dw_hdma_v0_core_ch_config(struct dw_edma_chan *chan)
+ {
+ 	struct dw_edma *dw = chan->dw;
+diff --git a/drivers/dma/dw-edma/dw-hdma-v0-regs.h b/drivers/dma/dw-edma/dw-hdma-v0-regs.h
+index eab5fd7177e5..7759ba9b4850 100644
+--- a/drivers/dma/dw-edma/dw-hdma-v0-regs.h
++++ b/drivers/dma/dw-edma/dw-hdma-v0-regs.h
+@@ -12,6 +12,7 @@
+ #include <linux/dmaengine.h>
+ 
+ #define HDMA_V0_MAX_NR_CH			8
++#define HDMA_V0_CH_EN				BIT(0)
+ #define HDMA_V0_LOCAL_ABORT_INT_EN		BIT(6)
+ #define HDMA_V0_REMOTE_ABORT_INT_EN		BIT(5)
+ #define HDMA_V0_LOCAL_STOP_INT_EN		BIT(4)
+diff --git a/include/linux/dma/edma.h b/include/linux/dma/edma.h
+index 270b5458aecf..61d6064fcfed 100644
+--- a/include/linux/dma/edma.h
++++ b/include/linux/dma/edma.h
+@@ -97,6 +97,7 @@ struct dw_edma_chip {
+ 	enum dw_edma_map_format	mf;
+ 
+ 	struct dw_edma		*dw;
++	bool			cfg_non_ll;
+ };
+ 
+ /* Export to the platform drivers */

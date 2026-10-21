@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Author: AMD
+
+dw-edma-test-objs := dw_edma_test.o
+obj-m += dw-edma-test.o
+
+of-dw-edma-objs := of_dw_edma.o
+obj-m += of-dw-edma.o

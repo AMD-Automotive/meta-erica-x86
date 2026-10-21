@@ -1,0 +1,104 @@
+#!/bin/sh
+# Copyright (C) 2011 O.S. Systems Software LTDA.
+# Modifications Copyright © 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+#
+# Derived from the poky initramfs-framework setup-live module.
+# rave2-buddy: support WIC media (no rootfs.img), skip NVMe mounts,
+# use msg() for guaranteed /dev/console output, fix $i->$ROOT_DISK bug.
+
+setup_enabled() {
+        return 0
+}
+
+# Return 0 (true) if the device backing a /run/media mount belongs
+# to the NVMe install target and must be skipped.
+is_on_nvme() {
+        local name="$1"
+        local mnt="/run/media/$name"
+        local dev
+        dev=$(awk -v mp="$mnt" '$2 == mp {print $1; exit}' /proc/mounts 2>/dev/null)
+        case "$dev" in
+                /dev/nvme*) return 0 ;;
+        esac
+        # A swap or otherwise-unmounted partition has no /proc/mounts entry,
+        # so the device lookup above fails. The mount helper names /run/media
+        # entries "<label>-<kernelname>" (e.g. "ubuntu-swap-nvme0n1p7"), so
+        # fall back to matching the entry name. Without this an Ubuntu swap
+        # partition left on the target NVMe is mis-selected as install media.
+        case "$name" in
+                *nvme*) return 0 ;;
+        esac
+        return 1
+}
+
+setup_run() {
+ROOT_IMAGE="rootfs.img"
+ISOLINUX=""
+ROOT_DISK=""
+shelltimeout=30
+found=""
+
+        msg "setup-live: start label=$bootparam_LABEL root=$bootparam_root"
+
+        if [ -z "$bootparam_root" -o "$bootparam_root" = "/dev/ram0" ]; then
+                msg "Waiting for removable media..."
+                C=0
+                while true
+                do
+                  msg "setup-live: scanning /run/media (elapsed ${C}s)"
+                  for i in `ls /run/media 2>/dev/null`; do
+                      # Skip any mount whose underlying device is on NVMe.
+                      # The install target is NVMe, so these are from a
+                      # previous install, not the USB install media.
+                      if is_on_nvme "$i"; then
+                              msg "setup-live: skipping $i (NVMe device)"
+                              continue
+                      fi
+                      if [ -f /run/media/$i/$ROOT_IMAGE ] ; then
+                                found="yes"
+                                ROOT_DISK="$i"
+                                break
+                      elif [ -f /run/media/$i/isolinux/$ROOT_IMAGE ] ; then
+                                found="yes"
+                                ISOLINUX="isolinux"
+                                ROOT_DISK="$i"
+                                break
+                      elif [ "$bootparam_LABEL" != "boot" ] && [ -d /run/media/$i ]; then
+                                found="yes"
+                                ROOT_DISK="$i"
+                                break
+                      fi
+                  done
+                  if [ "$found" = "yes" ]; then
+                      break;
+                  fi
+                  # don't wait for more than $shelltimeout seconds, if it's set
+                  if [ -n "$shelltimeout" ]; then
+                      echo -n " " $(( $shelltimeout - $C ))
+                      if [ $C -ge $shelltimeout ]; then
+                           echo "..."
+                           msg "Mounted filesystems"
+                           mount | grep media
+                           msg "Available block devices"
+                           cat /proc/partitions
+                           fatal "Cannot find $ROOT_IMAGE file in /run/media/* , dropping to a shell "
+                      fi
+                      C=$(( C + 1 ))
+                  fi
+                  sleep 1
+                done
+                bootparam_root="/run/media/$ROOT_DISK/$ISOLINUX/$ROOT_IMAGE"
+                msg "setup-live: selected media ROOT_DISK=$ROOT_DISK ISOLINUX=$ISOLINUX"
+        fi
+
+        if [ "$bootparam_LABEL" != "boot" -a -f /init.d/$bootparam_LABEL.sh ] ; then
+                MEDIA_ARG="$ROOT_DISK/$ISOLINUX"
+                [ -z "$ROOT_DISK" ] && MEDIA_ARG="auto"
+                msg "setup-live: launching /init.d/$bootparam_LABEL.sh media=$MEDIA_ARG image=$ROOT_IMAGE"
+                ./init.d/$bootparam_LABEL.sh $MEDIA_ARG $ROOT_IMAGE $video_mode $vga_mode $console_params
+                fatal "Target $bootparam_LABEL failed"
+        fi
+}

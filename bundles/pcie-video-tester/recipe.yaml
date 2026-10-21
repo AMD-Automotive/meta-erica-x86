@@ -1,0 +1,85 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC, TO
+# Maintainer: KC
+
+# recipe.yaml — PCIe Video Tester (.rave2app authoring recipe)
+#
+# Built by: python3 bundles/_packer/make_bundle.py bundles/pcie-video-tester/recipe.yaml
+# See ../../docs/app-bundle-installer/phase-7-bundle-authoring.md
+recipe_version: 1
+
+# ---- Identity (copied verbatim into appimage.yaml + catalog) ----
+id: pcie-video-tester
+name: PCIe Video Tester
+version: auto            # "auto" -> resolved to the git SHA, prepended to the bundle name (unique per commit)
+vendor: AMD
+description: PCIe video test application - x86 host (Ubuntu) plus Versal OSPI + UFS images.
+
+# ---- App-slot filesystem the device formats before deploying the x86 side ----
+slot:
+  filesystem: ext4
+  label: app-a
+  mkfs_options: "-O ^orphan_file"   # menu GRUB ext driver can't read orphan_file
+
+# ---- Boot behaviour for the installed app ----
+boot:
+  label: PCIe Video Tester
+  make_default: false
+  # `linux-generic` maintains these two symlinks whatever kernel apt installed,
+  # and GRUB's ext driver follows them, so the version never has to be known
+  # here. No kernel_args: root= is the installer's to set.
+  cmdline:
+    kernel: /boot/vmlinuz
+    ramdisk: /boot/initrd.img               # install, but leave the current default (Buddy)
+
+# ---- Moving parts. Resolved in order; each ships as a bundle member. ----
+components:
+  # x86 host side: a device-time script that installs Ubuntu onto the app slot
+  # (no rootfs shipped in the bundle — the script builds it on-device at install
+  # time, so we never redistribute Ubuntu). The member IS the build script.
+  - name: x86-build
+    kind: custom-build
+    source:
+      type: file
+      from: device/build.sh
+      produces: x86/build.sh
+
+  # The Welcome GUI app (preflight health-checks + split-screen consoles).
+  # Packed as an uncompressed tar member; build.sh lays it into the slot at
+  # /opt/welcome-gui and wires up autostart. Declared as an `overlay` with that
+  # target so a generic installer would place it identically.
+  - name: welcome-gui
+    kind: overlay
+    target: /opt/welcome-gui
+    stage: post-deploy
+    source:
+      type: script
+      run: device/pack-welcome-gui.sh
+      produces: x86/welcome-gui.tar
+
+  # Versal OSPI image (boot.bin). The CI artifact is already gzipped; stored
+  # as-is at versal/boot.bin.gz and kept gzipped on the slot.
+  - name: versal-ospi
+    kind: versal-ospi
+    source:
+      type: url
+      from: http://xsj-erica-revenant.xlnx.xilinx.com/meta-erica-edf/5ec19a_d523d9___rave2-ecp_2025.2-edf-ospi.bin.gz
+      produces: versal/boot.bin.gz
+
+  # Versal UFS rootfs (wic.ufs). Already gzipped; stored as-is at versal/wic.ufs.gz.
+  - name: versal-wic
+    kind: versal-wic
+    source:
+      type: url
+      from: http://xsj-erica-revenant.xlnx.xilinx.com/meta-erica-edf/5ec19a_d523d9___amd-cortexa78-mali-common_2025.2-erica-appdev-image.wic.ufs.gz
+      produces: versal/wic.ufs.gz
+
+# ---- Catalog fields (NEVER enter the bundle; render appstore.json) ----
+catalog:
+  short_description: PCIe video test (x86 + Versal)
+  description_long: >-
+    PCIe video test application. Installs an Ubuntu-based x86 host onto the
+    application slot and programs the Versal OSPI + UFS images.
+  thumbnail: https://rave2.cicdstorage.com/updates/thumbs/pcie-video-tester.png
+  experimental: true

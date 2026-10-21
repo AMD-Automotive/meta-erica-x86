@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Author: AMD
+
+rave-kms-objs := rave_kms.o
+obj-m += rave-kms.o

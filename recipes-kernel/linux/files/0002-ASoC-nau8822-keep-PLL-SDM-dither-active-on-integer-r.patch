@@ -1,0 +1,59 @@
+From 3cd97756dfd6e4be7d6118d619c4c4473fc91556 Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 27 Apr 2026 09:02:13 +0100
+Subject: [PATCH] ASoC: nau8822: keep PLL SDM dither active on integer ratios
+
+When the requested PLL output frequency is an exact integer multiple
+of the input clock (e.g. 12.288 MHz -> 98.304 MHz with N=8 driving
+the 256xfs path), nau8822_calc_pll() computes pll_frac = 0 and the
+fractional-N sigma-delta modulator is left with no input. Without
+SDM activity the PLL effectively passes the reference oscillator's
+jitter straight through to the DAC/ADC oversampling clock, where it
+is demodulated as in-band audio artefacts.
+
+Floor pll_frac to 1 when it would otherwise be zero. The added
+fractional component is 1/2^24 (~60 ppb of f_out), far below any
+audible threshold, but is sufficient to keep the SDM dithering and
+decorrelating reference jitter from the audio band. The chip's
+power-on reset values for K1/K2/K3 are non-zero for the same reason
+- this brings calc_pll's output into line with the silicon's own
+intended steady state.
+
+Measured on a board with a 12.288 MHz crystal driving the codec
+MCLK pin and the codec acting as I2S clock provider: with K=0
+(prior behaviour) intermod sidebands were 36-42 dB worse and HF
+noise was 40-58 dB worse than with the POR K values; flooring
+pll_frac to 1 closes the gap.
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ sound/soc/codecs/nau8822.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/sound/soc/codecs/nau8822.c b/sound/soc/codecs/nau8822.c
+index a11759f85eac..a4b6c93e3dcb 100644
+--- a/sound/soc/codecs/nau8822.c
++++ b/sound/soc/codecs/nau8822.c
+@@ -648,6 +648,19 @@ static int nau8822_calc_pll(unsigned int pll_in, unsigned int fs,
+ 	pll_param->pll_int = (pll_ratio >> 28) & 0xF;
+ 	pll_param->pll_frac = ((pll_ratio & 0xFFFFFFF) >> 4);
+ 
++	/*
++	 * When pll_in evenly divides the target VCO frequency the fractional
++	 * portion of the divide ratio is zero and the PLL fractional-N sigma-
++	 * delta modulator has no input; the modulator is then effectively a
++	 * pass-through and the input clock's jitter reaches the DAC/ADC
++	 * oversampling clock unattenuated. Floor pll_frac to 1 (~60 ppb of
++	 * f_out, well below any audible threshold) so the SDM stays active
++	 * and decorrelates jitter from the audio band. The chip's power-on
++	 * reset values for K1/K2/K3 are non-zero for the same reason.
++	 */
++	if (!pll_param->pll_frac)
++		pll_param->pll_frac = 1;
++
+ 	return 0;
+ }
+ 
+-- 
+2.34.1
+

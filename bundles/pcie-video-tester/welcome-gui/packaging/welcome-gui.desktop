@@ -1,0 +1,16 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+[Desktop Entry]
+Type=Application
+Name=PCIe Video Tester — Welcome
+Comment=Preflight checks and welcome screen for the PCIe Video Tester
+Exec=/opt/welcome-gui/scripts/run-welcome-gui.sh
+Icon=video-display
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2
+NoDisplay=false
+Categories=Utility;

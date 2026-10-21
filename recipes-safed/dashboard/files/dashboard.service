@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# Contributors: AK
+# Maintainer: AK
+
+[Unit]
+Description=RAVE Dashboard
+After=weston.service
+Requires=weston.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Weston runs as the "weston" user (uid 1000) under poky's weston-init, so its
+# wayland socket lives in that user's runtime dir, not root's.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=QT_QPA_PLATFORM=wayland
+ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 60 ]; do [ -S /run/user/1000/wayland-1 ] && exit 0; i=$((i+1)); sleep 1; done; exit 1'
+ExecStart=/usr/bin/dashboard --name radeon --screen Virtual-1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

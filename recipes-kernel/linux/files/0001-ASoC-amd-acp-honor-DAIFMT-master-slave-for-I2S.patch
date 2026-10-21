@@ -1,0 +1,121 @@
+From 460bdfd9e6521ee8a907fc9d62dcf245c885883e Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 27 Apr 2026 09:01:38 +0100
+Subject: [PATCH] ASoC: amd: acp: honor DAIFMT master/slave for I2S
+
+The ACP I2S driver unconditionally asserts I2S_MASTER_MODE_ENABLE in
+the per-port master-clock-generator register (ACP_I2STDMx_MSTRCLKGEN
+bit 0) and programs BCLK/LRCLK dividers from hw_params regardless of
+the DAIFMT clock-provider bits.  The hardware does support consumer
+mode on each I2S port (bit 0 = 0 puts the port in slave mode), but
+the driver never honours a CBP_CFP request from the link.
+
+This matters for boards where the codec has its own audio-grade MCLK
+(for example a local crystal oscillator): in that case making the
+codec the bit/frame-clock provider gives crystal-accurate sample
+timing and avoids any dependence on the ACP audio clock tree being
+programmed to the correct frequency.
+
+Track the clock provider per I2S port (an array indexed by I2S_SP /
+I2S_BT / I2S_HS instance) rather than chip-wide so that boards with
+mixed master/slave links - e.g. a codec on I2S_SP plus a dummy or
+secondary link on I2S_BT - are programmed correctly without one
+link's set_fmt clobbering another's master-mode bit.
+
+Note that snd_soc_runtime_set_dai_fmt() flips the clock-provider
+bits when forwarding the link's dai_fmt to the cpu_dai
+(snd_soc_daifmt_clock_provider_flipped()): from the cpu_dai's point
+of view CBC_CFC means "ACP is the consumer => the codec drives
+BCLK/LRCLK" and CBP_CFP means "ACP is the provider".  Decode
+accordingly in acp_i2s_set_fmt(), stash the choice in the per-port
+slot, and skip MASTER_MODE + divider programming when the codec is
+the clock provider for that port.  All existing upstream boards
+request CBC_CFC at the link level (cpu_dai sees CBP_CFP after the
+flip) so today's behaviour is preserved.
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ sound/soc/amd/acp/acp-i2s.c | 28 +++++++++++++++++++++++++---
+ sound/soc/amd/acp/amd.h     |  6 ++++++
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/sound/soc/amd/acp/acp-i2s.c b/sound/soc/amd/acp/acp-i2s.c
+index 283a674c7e2c..8df94ddf452b 100644
+--- a/sound/soc/amd/acp/acp-i2s.c
++++ b/sound/soc/amd/acp/acp-i2s.c
+@@ -50,7 +50,8 @@ static inline void acp_set_i2s_clk(struct acp_chip_info *chip, int dai_id)
+ 		break;
+ 	}
+ 
+-	val  = I2S_MASTER_MODE_ENABLE;
++	/* If the codec is the clock provider, ACP operates as I2S slave. */
++	val  = chip->codec_is_clk_provider[dai_id - 1] ? 0 : I2S_MASTER_MODE_ENABLE;
+ 	if (chip->tdm_mode)
+ 		val |= BIT(1);
+ 
+@@ -87,6 +88,26 @@ static int acp_i2s_set_fmt(struct snd_soc_dai *cpu_dai,
+ 	default:
+ 		return -EINVAL;
+ 	}
++
++	/*
++	 * snd_soc_runtime_set_dai_fmt() flips the clock-provider bits when
++	 * forwarding the link's dai_fmt to the cpu_dai (snd_soc_daifmt_clock_
++	 * provider_flipped()): if the link declares CBP_CFP (codec is provider)
++	 * the cpu_dai sees CBC_CFC, and vice versa.  So from the cpu side,
++	 * CBC_CFC means "ACP is the consumer => the codec drives BCLK/LRCLK"
++	 * and CBP_CFP means "ACP is the provider => ACP drives BCLK/LRCLK".
++	 */
++	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
++	case SND_SOC_DAIFMT_CBC_CFC:
++		chip->codec_is_clk_provider[cpu_dai->driver->id - 1] = true;
++		break;
++	case SND_SOC_DAIFMT_CBP_CFP:
++		chip->codec_is_clk_provider[cpu_dai->driver->id - 1] = false;
++		break;
++	default:
++		return -EINVAL;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -278,7 +299,8 @@ static int acp_i2s_hwparams(struct snd_pcm_substream *substream, struct snd_pcm_
+ 		writel(tdm_fmt, chip->base + fmt_reg);
+ 	}
+ 
+-	if (rsrc->soc_mclk) {
++	/* Only compute BCLK/LRCLK dividers when ACP is the clock provider. */
++	if (!chip->codec_is_clk_provider[dai->driver->id - 1]) {
+ 		switch (params_format(params)) {
+ 		case SNDRV_PCM_FORMAT_S16_LE:
+ 			switch (params_rate(params)) {
+@@ -452,7 +474,7 @@ static int acp_i2s_trigger(struct snd_pcm_substream *substream, int cmd, struct
+ 
+ 		writel(period_bytes, chip->base + water_val);
+ 		writel(buf_size, chip->base + buf_reg);
+-		if (rsrc->soc_mclk)
++		if (!chip->codec_is_clk_provider[dai->driver->id - 1])
+ 			acp_set_i2s_clk(chip, dai->driver->id);
+ 		val = readl(chip->base + reg_val);
+ 		val = val | BIT(0);
+diff --git a/sound/soc/amd/acp/amd.h b/sound/soc/amd/acp/amd.h
+index 73a028e67246..533d49d7e207 100644
+--- a/sound/soc/amd/acp/amd.h
++++ b/sound/soc/amd/acp/amd.h
+@@ -170,6 +170,12 @@ struct acp_chip_info {
+ 	bool is_pdm_config;	/* flag set to true when PDM configuration is selected from BIOS */
+ 	bool is_i2s_config;	/* flag set to true when I2S configuration is selected from BIOS */
+ 	bool tdm_mode;
++	/*
++	 * True when the codec drives BCLK/LRCLK on a given I2S port.
++	 * Indexed by (I2S_{SP,BT,HS}_INSTANCE - 1) so the three ports
++	 * can carry independent clock-provider settings simultaneously.
++	 */
++	bool codec_is_clk_provider[3];
+ };
+ 
+ struct acp_stream {
+-- 
+2.34.1
+

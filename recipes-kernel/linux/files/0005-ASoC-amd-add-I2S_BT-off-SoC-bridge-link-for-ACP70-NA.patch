@@ -1,0 +1,220 @@
+From a55de80f7691b04cf963c86df6e02ce573ea8dac Mon Sep 17 00:00:00 2001
+From: Kris Chaplin <kris.chaplin@amd.com>
+Date: Mon, 27 Apr 2026 09:10:35 +0100
+Subject: [PATCH] ASoC: amd: add I2S_BT off-SoC bridge link for ACP70 NAU8822
+ board
+
+Add a second I2S link on ACP70 (I2S_BT) for boards that route the
+ACP I2S_BT pins straight off the Ryzen die into a downstream FPGA
+fabric.  On RAVE2 / Strix Halo the I2S_BT signals leave the SoC via
+a board-level level shifter and land on AMD Versal PL pins (Bank
+402 HDIO); the Versal fabric then has free hand to mux, gate or
+rate-convert the audio to whatever the application's design uses.
+The reference design wires it through to a PMOD header carrying a
+PCM5102A DAC, but other Versal projects can re-use the same Linux
+machine driver to drive an arbitrary number of FPGA-side sinks.
+
+Linux therefore sees an opaque downstream sink: model it with the
+dummy codec on this link.  The downstream ADAU1860 is configured
+externally (no SSDT, no Linux codec driver) and generates BCLK and
+LRCLK into the Ryzen together with the TDM framing, so the ACP
+I2S_BT port runs as the clock consumer (CBP_CFP).  Both playback
+and capture are enabled so a downstream codec ADC reached via the
+Versal PL bridge (e.g. ADAU1860 mic input on RAVE2) can be
+captured through the same DAI link.
+
+This relies on the per-DAI codec_is_clk_provider tracking added by
+the companion 'honor DAIFMT master/slave' patch: with the chip-wide
+flag the I2S_SP NAU8822 link's CBP_CFP setting would clobber I2S_BT
+master-mode programming.
+
+Set bt_cpu_id = I2S_BT on the existing nau8822_acp70_data, declare
+the i2s_bt CPU dailink, count it in num_links in the legacy
+dai_links_create path (the SOF DSP path already does), and emit the
+new acp-versal-bridge dummy link with the ACP70 platform component.
+
+Run the link in 4-slot 16-bit TDM (Phase 3.2): on RAVE2 the downstream
+ADAU1860 carries four PDM mics into a single SPT0 TDM frame
+(BCLK = 48 kHz x 16 x 4 = 3.072 MHz).  All four slots are populated in
+both directions (tx_mask = rx_mask = 0xf): the external codec derives
+BCLK from the populated slot count, so a 2-slot mask would request
+1.536 MHz, below its 3.072 MHz minimum.  `arecord -c 4 -f S16_LE
+-r 48000 hw:1,1` then surfaces all four mics as channels 0..3 with
+codec-side slot order [DMIC2, DMIC3, DMIC0, DMIC1] (= TL/BL/TR/BR on
+the bring-up plate, see docs/dmic-pinout.md in the RAVE2 BSP).
+
+The ACP set_tdm_slot handler only programs tdm_tx_fmt/tdm_rx_fmt for
+streams already on chip->stream_list, and that list is empty at link
+init() time, so the slot setup must be re-issued from a hw_params op
+once the PCM is open.  Without it the frame descriptor stays zero and
+the ACP repeats each sample across the 4-slot frame.
+
+Signed-off-by: Kris Chaplin <kris.chaplin@amd.com>
+---
+ sound/soc/amd/acp/acp-legacy-mach.c |   1 +
+ sound/soc/amd/acp/acp-mach-common.c | 120 ++++++++++++++++++++++++++++
+ 2 files changed, 121 insertions(+)
+
+diff --git a/sound/soc/amd/acp/acp-legacy-mach.c b/sound/soc/amd/acp/acp-legacy-mach.c
+index 35604b6a2f78..088860461e7f 100644
+--- a/sound/soc/amd/acp/acp-legacy-mach.c
++++ b/sound/soc/amd/acp/acp-legacy-mach.c
+@@ -89,6 +89,7 @@ static struct acp_card_drvdata acp_dmic_data = {
+ static struct acp_card_drvdata nau8822_acp70_data = {
+ 	.hs_cpu_id = I2S_SP,
+ 	.hs_codec_id = NAU8822,
++	.bt_cpu_id = I2S_BT,
+ 	.soc_mclk = false,
+ 	.tdm_mode = false,
+ };
+diff --git a/sound/soc/amd/acp/acp-mach-common.c b/sound/soc/amd/acp/acp-mach-common.c
+index be8d86165ed8..8362c008ec50 100644
+--- a/sound/soc/amd/acp/acp-mach-common.c
++++ b/sound/soc/amd/acp/acp-mach-common.c
+@@ -1463,6 +1463,79 @@ SND_SOC_DAILINK_DEF(i2s_sp,
+ 	DAILINK_COMP_ARRAY(COMP_CPU("acp-i2s-sp")));
+ SND_SOC_DAILINK_DEF(i2s_hs,
+ 		    DAILINK_COMP_ARRAY(COMP_CPU("acp-i2s-hs")));
++SND_SOC_DAILINK_DEF(i2s_bt,
++		    DAILINK_COMP_ARRAY(COMP_CPU("acp-i2s-bt")));
++
++/*
++ * RAVE2 / Phase 3.2: the off-SoC ADAU1860 is configured externally and
++ * carries four PDM mics into a single SPT0 TDM frame (4 slots x 16-bit,
++ * 48 kHz, BCLK = 3.072 MHz).  It drives SDATAO_0 with slot ordering
++ * [DMIC2, DMIC3, DMIC0, DMIC1] (= [TL, BL, TR, BR] given the bring-up
++ * plate channel map in docs/dmic-pinout.md).  All four slots are
++ * populated in both directions: the codec derives BCLK from the
++ * populated slot count, so tx_mask/rx_mask must both be 0xf to give
++ * 4 x 16 x 48 kHz = 3.072 MHz, its minimum master bit clock.
++ */
++static const unsigned int versal_bridge_channels[] = {
++	FOUR_CHANNEL,
++};
++
++static const struct snd_pcm_hw_constraint_list versal_bridge_constraints_channels = {
++	.count = ARRAY_SIZE(versal_bridge_channels),
++	.list = versal_bridge_channels,
++	.mask = 0,
++};
++
++static int acp_versal_bridge_init(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	int ret;
++
++	ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0xf, 0xf, 4, 16);
++	if (ret && ret != -ENOTSUPP)
++		return ret;
++	return 0;
++}
++
++static int acp_versal_bridge_startup(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++
++	runtime->hw.channels_min = FOUR_CHANNEL;
++	runtime->hw.channels_max = FOUR_CHANNEL;
++	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
++				   &versal_bridge_constraints_channels);
++	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
++				   &constraints_rates);
++	return 0;
++}
++
++/*
++ * The ACP set_tdm_slot handler only programs tdm_tx_fmt/tdm_rx_fmt for
++ * streams already on chip->stream_list, which is empty at link init() time.
++ * Re-issue the slot setup here, where the PCM is open and the stream is on
++ * the list; otherwise the frame descriptor stays 0 and the ACP repeats each
++ * sample across the 4-slot frame.
++ */
++static int acp_versal_bridge_hw_params(struct snd_pcm_substream *substream,
++				       struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	int ret;
++
++	ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0xf, 0xf, 4, 16);
++	if (ret && ret != -ENOTSUPP)
++		return ret;
++
++	return 0;
++}
++
++static const struct snd_soc_ops acp_versal_bridge_ops = {
++	.startup = acp_versal_bridge_startup,
++	.hw_params = acp_versal_bridge_hw_params,
++};
++
+ SND_SOC_DAILINK_DEF(sof_sp,
+ 	DAILINK_COMP_ARRAY(COMP_CPU("acp-sof-sp")));
+ SND_SOC_DAILINK_DEF(sof_sp_virtual,
+@@ -1752,6 +1825,8 @@ int acp_legacy_dai_links_create(struct snd_soc_card *card)
+ 
+ 	if (drv_data->hs_cpu_id)
+ 		num_links++;
++	if (drv_data->bt_cpu_id)
++		num_links++;
+ 	if (drv_data->amp_cpu_id)
+ 		num_links++;
+ 	if (drv_data->dmic_cpu_id)
+@@ -1927,6 +2002,54 @@ int acp_legacy_dai_links_create(struct snd_soc_card *card)
+ 		i++;
+ 	}
+ 
++	if (drv_data->bt_cpu_id == I2S_BT) {
++		/*
++		 * I2S_BT pins routed off-SoC (no codec on the AMD side).
++		 *
++		 * On RAVE2 / Strix Halo, the ACP I2S_BT signals leave the
++		 * Ryzen via a board-level level shifter and go straight into
++		 * AMD Versal PL pins (Bank 402 HDIO).  The Versal FPGA fabric
++		 * is then free to route, mux, gate or rate-convert the audio
++		 * to whichever destination the application wants - in the
++		 * RAVE2 reference design this is a PMOD header carrying a
++		 * PCM5102A DAC, but the Linux side only sees an opaque
++		 * downstream sink.  Use the dummy codec on this link so the
++		 * same machine driver works regardless of what the FPGA does
++		 * downstream.  The downstream ADAU1860 is configured
++		 * externally and generates BCLK/LRCLK into the Ryzen along
++		 * with the TDM framing, so the ACP I2S_BT port runs as the
++		 * clock consumer (CBP_CFP) on a DSP_A 4-slot 16-bit frame.
++		 * Both playback and capture are enabled so a downstream
++		 * microphone (e.g. ADAU1860 ADC over the Versal PL bridge)
++		 * can be wired up via the same DAI link; all four PDM mics
++		 * surface as channels 0..3 on hw:1,1.
++		 */
++		links[i].name = "acp-versal-bridge";
++		links[i].id = BT_BE_ID;
++		links[i].cpus = i2s_bt;
++		links[i].num_cpus = ARRAY_SIZE(i2s_bt);
++		links[i].codecs = &snd_soc_dummy_dlc;
++		links[i].num_codecs = 1;
++		links[i].dai_fmt = SND_SOC_DAIFMT_DSP_A |
++				   SND_SOC_DAIFMT_NB_NF |
++				   SND_SOC_DAIFMT_CBP_CFP;
++		links[i].init = acp_versal_bridge_init;
++		links[i].ops = &acp_versal_bridge_ops;
++		switch (drv_data->acp_rev) {
++		case ACP70_PCI_ID:
++		case ACP71_PCI_ID:
++		case ACP72_PCI_ID:
++			links[i].platforms = platform_acp70_component;
++			links[i].num_platforms = ARRAY_SIZE(platform_acp70_component);
++			break;
++		default:
++			links[i].platforms = platform_component;
++			links[i].num_platforms = ARRAY_SIZE(platform_component);
++			break;
++		}
++		i++;
++	}
++
+ 	if (drv_data->dmic_cpu_id == DMIC) {
+ 		links[i].name = "acp-dmic-codec";
+ 		links[i].stream_name = "DMIC capture";
+-- 
+2.34.1
+

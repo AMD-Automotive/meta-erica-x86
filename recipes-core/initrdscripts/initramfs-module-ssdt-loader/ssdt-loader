@@ -1,0 +1,95 @@
+#!/bin/sh
+# Copyright © Advanced Micro Devices, Inc., or its affiliates. All rights reserved.
+# SPDX-License-Identifier: MIT
+# Contributors: KC
+# Maintainer: KC
+
+# SSDT loader for initramfs-framework
+#
+# Loads SSDT overlays via ACPI ConfigFS before switch_root.
+# SSDTs are specified via kernel cmdline: ssdt=name1,name2,...
+# Each name corresponds to /lib/firmware/acpi/ssdt-templates/<name>.aml
+#
+# This ensures ACPI namespace contains required devices before any
+# drivers probe, avoiding race conditions with udev module loading.
+#
+# NOTE on function names: the initramfs-framework /init dispatcher
+# computes the module name from the script filename as:
+#     basename "$file" | cut -d'-' -f 2
+# So for "10-ssdt-loader" the module name is "ssdt" (everything after
+# the second '-' is dropped). Functions must therefore be named
+# ssdt_enabled / ssdt_run — not ssdt_loader_*.
+
+ssdt_enabled() {
+    # Always run - will check cmdline for work to do
+    return 0
+}
+
+ssdt_run() {
+    local ssdt_param ssdt_list ssdt_name ssdt_file configfs_path table_dir
+
+    # Parse kernel cmdline for ssdt= parameter
+    ssdt_param=""
+    for arg in $(cat /proc/cmdline); do
+        case "$arg" in
+            ssdt=*)
+                ssdt_param="${arg#ssdt=}"
+                ;;
+        esac
+    done
+
+    if [ -z "$ssdt_param" ]; then
+        msg "ssdt-loader: no ssdt= parameter, skipping"
+        return 0
+    fi
+
+    msg "ssdt-loader: loading SSDTs: $ssdt_param"
+
+    # Ensure configfs is loaded and mounted, then load acpi_configfs
+    # so /sys/kernel/config/acpi/table appears.
+    modprobe configfs 2>/dev/null
+    configfs_path="/sys/kernel/config"
+    if ! grep -q "^configfs $configfs_path " /proc/mounts 2>/dev/null; then
+        mkdir -p "$configfs_path" 2>/dev/null
+        if ! mount -t configfs configfs "$configfs_path" 2>/dev/null; then
+            msg "ssdt-loader: failed to mount configfs"
+            return 1
+        fi
+    fi
+    modprobe acpi_configfs 2>/dev/null
+
+    if [ ! -d "$configfs_path/acpi/table" ]; then
+        msg "ssdt-loader: acpi_configfs not available (no $configfs_path/acpi/table)"
+        return 1
+    fi
+
+    # Process comma-separated list
+    ssdt_list=$(echo "$ssdt_param" | tr ',' ' ')
+    
+    for ssdt_name in $ssdt_list; do
+        ssdt_file="/lib/firmware/acpi/ssdt-templates/${ssdt_name}.aml"
+        
+        if [ ! -f "$ssdt_file" ]; then
+            msg "ssdt-loader: template not found: $ssdt_file"
+            continue
+        fi
+
+        table_dir="$configfs_path/acpi/table/$ssdt_name"
+        
+        # Create table directory
+        if ! mkdir -p "$table_dir" 2>/dev/null; then
+            msg "ssdt-loader: failed to create $table_dir"
+            continue
+        fi
+
+        # Load AML
+        if cat "$ssdt_file" > "$table_dir/aml" 2>/dev/null; then
+            msg "ssdt-loader: loaded $ssdt_name"
+        else
+            msg "ssdt-loader: failed to load $ssdt_name"
+            rmdir "$table_dir" 2>/dev/null
+        fi
+    done
+
+    return 0
+}
